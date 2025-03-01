@@ -46,7 +46,7 @@
 # - ON: enable CUDA with cmake's auto search
 # - OFF: disable CUDA
 # - /path/to/cuda: use specific path to cuda toolkit
-set(USE_CUDA OFF)
+set(USE_CUDA ON)
 
 # Whether to enable NCCL support:
 # - ON: enable NCCL with cmake's auto search
@@ -62,7 +62,7 @@ set(USE_MSCCL OFF)
 # Whether to enable NVTX support (must have USE_CUDA enabled):
 # - ON: enable NCCL with cmake's auto search
 # - OFF: disable NCCL
-set(USE_NVTX OFF)
+set(USE_NVTX ON)
 
 # Whether enable ROCM runtime
 #
