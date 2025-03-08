@@ -63,7 +63,8 @@ TVM_REGISTER_GLOBAL("vm.builtin.genetic_algorithm_create")
       ObjectPtr<GeneticAlgorithmImplObj> n = make_object<GeneticAlgorithmImplObj>();
       *rv = GeneticAlgorithm(std::move(n));
     });
-
+TVM_REGISTER_GLOBAL("vm.builtin.genetic_algorithm_run")
+    .set_body_typed([](GeneticAlgorithm ga, NDArray o_data) { ga->Run(); });
 }  // namespace relax_vm
 }  // namespace runtime
 }  // namespace tvm

@@ -143,7 +143,7 @@ set(USE_PROFILER ON)
 # - OFF: disable llvm, note this will disable CPU codegen
 #        which is needed for most cases
 # - /path/to/llvm-config: enable specific LLVM when multiple llvm-dev is available.
-set(USE_LLVM OFF)
+set(USE_LLVM ON)
 
 # Whether use MLIR to help analyze, requires USE_LLVM is enabled
 # Possible values: ON/OFF
@@ -194,7 +194,7 @@ set(USE_AMX OFF)
 # Note: "gnu" uses gomp library, "intel" uses iomp5 library
 set(USE_OPENMP none)
 
-# Whether use contrib.random in runtime
+# Whether use contrib.random in runtim
 set(USE_RANDOM ON)
 
 # Whether use NNPack

@@ -20,7 +20,7 @@
 from tvm import relax
 from tvm.relax.frontend import nn
 
-from tvm.relax.frontend.nn.ga.genetic_algorithm import GeneticAlgorithm
+from tvm.relax.frontend.nn.ga.genetic_algorithm import GeneticAlgorithm, DefaultGeneticAlgorithm
 
 class GeneticAlgorithmConfig():
     pass
@@ -40,20 +40,24 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
 
     def run(self, ga: GeneticAlgorithm):
         return self.model(ga)
-    
-    def create_genetic_algorithm(  # pylint: disable=too-many-arguments
-        self,
-    ) -> GeneticAlgorithm:
-        return GeneticAlgorithm()
+
+    def create_genetic_algorithm(self) -> GeneticAlgorithm:
+        return DefaultGeneticAlgorithm()
 
     def get_default_spec(self):
         mod_spec = {
             "run": {
                 "ga": nn.spec.Object(object_type=GeneticAlgorithm),
                 "$": {
-                    "param_mode": "packed",
+                    "param_mode": "none",
                     "effect_mode": "none",
                 },
             },
+            "create_genetic_algorithm":{
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            }
         }
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)
