@@ -1052,6 +1052,10 @@ def permute(x: Tensor, axes: Optional[List[int]], name: str = "permute") -> Tens
 
     return wrap_nested(_op.permute_dims(x._expr, axes=axes), name)
 
+def power(x1: Tensor, x2: Tensor, name: str = "power") -> Tensor:
+    if isinstance(x1, int):
+        x1 = rx.const(x1, "int32")
+    return wrap_nested(_op.power(x1._expr, x2._expr), name)
 
 def negative(x: Tensor, name: str = "neg") -> Tensor:
     """Numerical negative of the input tensor.
@@ -1347,6 +1351,32 @@ def zeros(
     """
     return wrap_nested(_op.zeros(shape, dtype), name)
 
+def arange(
+        start, end = None, step=1 ,dtype = None, name: str = "arange",
+) -> Tensor:
+    """Construct a tensor with evenly spaced elements.
+
+    Parameters
+    ----------
+    start : Union[PrimExprLike,PrimValue]
+        The start of the interval.
+
+    end : Optional[Union[PrimExprLike,PrimValue]]
+        The end of the interval. If not given, it will be set to start,
+        and start will be set to 0.
+
+    step : Union[PrimExprLike,PrimValue]
+        The step size.
+
+    dtype : Optional[Union[str, DataType]]
+        The data type of the created tensor.
+
+    Returns
+    -------
+    result : relax.Expr
+        The result tensor.
+    """
+    return wrap_nested(_op.arange(start, end, step ,dtype), name)
 
 def ones(
     shape: Sequence[IntExpr],
@@ -2229,6 +2259,43 @@ def where(condition: Tensor, x1: Tensor, x2: Tensor, name: str = "where") -> Ten
     condition = astype(condition, "bool")
     return wrap_nested(_op.where(condition._expr, x1._expr, x2._expr), name)
 
+def scatter_nd(data: Tensor, indices: Tensor, updates: Tensor, reduction: str = "update", name: str = "where") -> Tensor:
+    """Scatter updates into an array according to indices.
+
+    Parameters
+    ----------
+    data: relax.Expr
+        The input data to be updated.
+
+    indices: relax.Expr
+        The index positions to update in `data`.
+
+    updates: relax.Expr
+        Values to replace to.
+
+    reduction: str
+        Type of reduction to apply: update, add, mul, max, min.
+        It is "update" by default.
+
+    Returns
+    -------
+    result : relax.Expr
+        The result has the same shape as data.
+
+    Examples
+    --------
+    .. code-block:: python
+
+       # inputs
+       data = [1, 2, 3, 4, 5, 6, 7, 8]
+       indices = [[4], [3], [1], [7]]
+       updates = [9, 10, 11, 12]
+
+       # output
+       output = [1, 11, 3, 10, 9, 6, 7, 12]
+
+    """
+    return wrap_nested(_op.scatter_nd(data._expr, indices._expr, updates._expr, reduction), name)
 
 def cumsum(
     data: Tensor,
@@ -2349,6 +2416,33 @@ def argsort(
         The indices of the sorted tensor.
     """
     return wrap_nested(_op.argsort(data._expr, axis, descending, dtype), name=name)
+
+def argmax(
+    x: Tensor, axis: Optional[int] = None, keepdims: bool = False, name="argmax"
+):
+    """Computes the argmax of tensor elements over given axis.
+
+    Parameters
+    ----------
+    x : relax.Expr
+        The input data tensor
+
+    axis : Optional[int]
+        Axis along which an argmax operation is performed.
+        The default, axis=None, will compute the argmax of all elements in the input tensor.
+        Negative indexing is supported.
+
+    keepdims : bool
+        If this is set to True, the axis being reduced is left in the result as dimensions
+        with size one.
+        With this option, the result will broadcast correctly against the input tensor.
+
+    Returns
+    -------
+    result : relax.Expr
+        The computed result.
+    """
+    return wrap_nested(_op.argmax(x._expr, axis, keepdims), name=name)
 
 
 def topk(

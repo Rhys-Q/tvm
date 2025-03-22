@@ -30,6 +30,12 @@ def run(lib_path):
     print(out)
 
 
+def test_random(lib_path):
+    model = tvm.runtime.load_module(lib_path)
+    dev = tvm.cpu(0)
+    vm = relax.VirtualMachine(model, dev)
+    init_data = vm["random_init"](None)
+    print(init_data)
 def parse_args():
     parser = argparse.ArgumentParser(description="Compile genetic algorithm model")
     parser.add_argument("--output", type=str, default="genetic_algorithm.so", help="Output file")
@@ -43,3 +49,7 @@ if __name__ == "__main__":
         compile(args.output)
     elif args.mode == "run":
         run(args.lib_path)
+    elif args.mode == "test_random":
+        test_random(args.lib_path)
+    else:
+        raise ValueError("unknown mode: {}".format(args.mode))
