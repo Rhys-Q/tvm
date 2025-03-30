@@ -188,6 +188,14 @@ def divide(a: Tensor, b: Tensor, name: str = "divide") -> Tensor:
     """
     return wrap_nested(_op.divide(a._expr, b._expr), name)
 
+def floor(x, name: str = "floor") -> Tensor:
+    return wrap_nested(_op.floor(x._expr), name)
+
+def round(x, name: str = "round") -> Tensor:
+    return wrap_nested(_op.round(x._expr), name)
+
+def mod(x, y, name: str = "mod") -> Tensor:
+    return wrap_nested(_op.mod(x._expr, y._expr), name)
 
 def chunk(x: Tensor, chunks: int, dim: int = 0, name: str = "chunk") -> Tensor:
     """Split a tensor along dim into the specified number of chunks.
@@ -784,6 +792,12 @@ def squeeze(x: Tensor, axis: int = -1, name: str = "squeeze") -> Tensor:
     """
     return wrap_nested(_op.squeeze(x._expr, axis), name)
 
+def clip(x: Tensor, minv: Tensor, maxv: Tensor, name: str = "clip") -> Tensor:
+    # if not isinstance(minv, Tensor):
+    #     minv = Tensor.from_const(minv)
+    # if not isinstance(maxv, Tensor):
+    #     maxv = Tensor.from_const(maxv)
+    return wrap_nested(_op.clip(x._expr, minv, maxv), name)
 
 def take(x: Tensor, indices: Tensor, axis: Optional[int] = None, name="take") -> Tensor:
     """Take elements from a tensor along an axis.

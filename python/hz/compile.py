@@ -44,6 +44,7 @@ def parse_args():
     return parser.parse_args()
 
 def test_gpu_compile(output_path = "ga_cuda.so"):
+    # config = GeneticAlgorithmConfig(min_values=[0,0], max_values=[100,100], eps=[1e-5,1e-5])
     config = GeneticAlgorithmConfig()
     model = GeneticAlgorithmWarp(config)
 
@@ -52,7 +53,7 @@ def test_gpu_compile(output_path = "ga_cuda.so"):
         allow_extern=True,
     )
     # mod = DispatchGACreation()(mod)
-    print(mod, flush=True)
+    # print(mod, flush=True)
     # target = tvm.target.Target("cuda")
     target = tvm.target.Target("nvidia/nvidia-a40")
     exec = relax.build(mod, target=target, params=named_params, pipeline=_pipeline(ext_mods))
