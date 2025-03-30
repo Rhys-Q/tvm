@@ -3,7 +3,7 @@ from tvm import relax
 import tvm
 from hz.genetic_algorithm import GeneticAlgorithmWarp, GeneticAlgorithmConfig
 from tvm.relax.frontend.nn.ga.dispatch_ga import DispatchGACreation
-
+from hz.pipeline.pipeline import _pipeline
 
 def compile(output_path = "genetic_algorithm.so"):
     config = GeneticAlgorithmConfig()
@@ -43,6 +43,30 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="compile", help="mode, compile or run")
     return parser.parse_args()
 
+def test_gpu_compile(output_path = "ga_cuda.so"):
+    config = GeneticAlgorithmConfig()
+    model = GeneticAlgorithmWarp(config)
+
+    mod, named_params, ext_mods = model.export_tvm(
+        spec=model.get_default_spec(),  # type: ignore
+        allow_extern=True,
+    )
+    # mod = DispatchGACreation()(mod)
+    print(mod, flush=True)
+    # target = tvm.target.Target("cuda")
+    target = tvm.target.Target("nvidia/nvidia-a40")
+    exec = relax.build(mod, target=target, params=named_params, pipeline=_pipeline(ext_mods))
+
+    exec.export_library(output_path)
+
+def test_random_cuda(lib_path):
+    model = tvm.runtime.load_module(lib_path)
+    dev = tvm.cuda(0)
+    vm = relax.VirtualMachine(model, dev)
+    init_data = vm["random_init"](None)
+    print(init_data.shape)
+
+
 if __name__ == "__main__":
     args = parse_args()
     if args.mode == "compile":
@@ -51,5 +75,9 @@ if __name__ == "__main__":
         run(args.lib_path)
     elif args.mode == "test_random":
         test_random(args.lib_path)
+    elif args.mode == "test_gpu_compile":
+        test_gpu_compile(args.output)
+    elif args.mode == "test_random_cuda":
+        test_random_cuda(args.lib_path)
     else:
         raise ValueError("unknown mode: {}".format(args.mode))

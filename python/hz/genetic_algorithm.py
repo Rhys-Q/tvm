@@ -21,7 +21,7 @@ from tvm import relax
 from tvm.relax.frontend import nn
 from tvm.contrib import random
 import numpy as np
-
+from .scatter_nd import ScatterNd
 from tvm.relax.frontend.nn.ga.genetic_algorithm import GeneticAlgorithm, DefaultGeneticAlgorithm
 import logging
 
@@ -69,15 +69,16 @@ class GeneticAlgorithmConfig():
         self.num_mutate = int(self.num_pop * mutate_rate)
         self.mutate_point = mutate_point
         self.eps = eps
-        self.pop_dtype = "uint8"
+        self.pop_dtype = "int32"
         assert self.num_pop == self.num_good + self.num_cross + self.num_mutate
     
 class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attributes
     def __init__(self, config: GeneticAlgorithmConfig):
         self.config = config
+        self.scatter_nd = ScatterNd()
 
     def _target_func(self, decoded_vars: nn.Tensor):
-        target_var = nn.Tensor.from_const(np.array([1,2,3,4], dtype=np.float32))
+        target_var = nn.Tensor.from_const(np.array([12,24,13,4], dtype=np.float32))
         y = decoded_vars - target_var
         y = y*y
         y = nn.op.sum(y, axis=1)
@@ -107,10 +108,14 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         fitness = fitness / sum_fitness
         fitness = nn.op.cumsum(fitness)
         rand_val_1 = nn.tensor_expr_op(random.uniform, "random.uniform", [0, 1, [self.config.num_cross,1 ]])
-        selected_index_1 = nn.op.argmax(rand_val_1 <= fitness, axis=1)
+        flag1 = rand_val_1 <= fitness
+        flag1 = nn.op.astype(flag1, "uint8")
+        selected_index_1 = nn.op.argmax(flag1, axis=1)
         cross_1 = nn.op.take(pop, selected_index_1, axis=0) 
         rand_val_2 = nn.tensor_expr_op(random.uniform, "random.uniform", [0, 1, [self.config.num_cross,1 ]])
-        selected_index_2 = nn.op.argmax(rand_val_2 <= fitness, axis=1)
+        flag2 = rand_val_2 <= fitness
+        flag2 = nn.op.astype(flag2, "uint8")
+        selected_index_2 = nn.op.argmax(flag2, axis=1)
         cross_2 = nn.op.take(pop, selected_index_2, axis=0)
         cross_index = nn.tensor_expr_op(random.randint, "random", [0, pop.shape[1], [cross_1.shape[0], 1]])
         index = nn.op.arange(0, pop.shape[1])
@@ -119,15 +124,15 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
 
     def _mutate(self, pop: nn.Tensor):
         mutate_index = nn.tensor_expr_op(random.randint, "random", [0, pop.shape[0], [self.config.num_mutate]])
-        modify_index_1 = nn.op.arange(0, self.config.num_mutate, dtype="int32")
-        modify_index_1 = nn.op.repeat(modify_index_1,self.config.mutate_point)
-        modify_index_1 = nn.op.reshape(modify_index_1, [self.config.num_mutate* self.config.mutate_point, 1])
-        modify_index_2 = nn.tensor_expr_op(random.randint, "random", [0, pop.shape[1], [self.config.num_mutate* self.config.mutate_point, 1]])
-        modify_index = nn.op.concat([modify_index_1, modify_index_2], dim=1)
+
+        modify_index_1 = nn.op.reshape(nn.op.arange(0, self.config.num_mutate, dtype="int32"), [1, self.config.num_mutate,1 ])
+        modify_index_1 = nn.op.repeat(modify_index_1,self.config.mutate_point, axis=2)
+        modify_index_2 = nn.tensor_expr_op(random.randint, "random", [0, pop.shape[1], [1, self.config.num_mutate, self.config.mutate_point]])
+        modify_index = nn.op.concat([modify_index_1, modify_index_2], dim=0) # [2, num_mutate, mutate_point]
         
-        modify_value = nn.tensor_expr_op(random.randint, "random", [0, 2, [self.config.num_mutate* self.config.mutate_point], pop.dtype])
+        modify_value = nn.tensor_expr_op(random.randint, "random", [0, 2, [self.config.num_mutate, self.config.mutate_point], pop.dtype])
         mutate_pop = nn.op.take(pop, mutate_index, axis=0)
-        mutate_pop = nn.op.scatter_nd(mutate_pop, modify_index, modify_value)
+        mutate_pop = self.scatter_nd(mutate_pop, modify_index, modify_value)
         return mutate_pop
     def random_init(self):
         return nn.tensor_expr_op(random.randint, "random", [0, 2, [self.config.num_pop, self.config.all_gene_len], self.config.pop_dtype])
@@ -142,7 +147,11 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         # 3. mutate
         pop_mutate = self._mutate(pop_cross)
         pop = nn.op.concat([pop_good, pop_cross, pop_mutate], dim=0)
-        return pop, values
+        # best
+        best_value = nn.op.take(values, nn.reshape(nn.Tensor.from_const(0), [1]).astype("int32"), axis=0)
+        best_gen = nn.op.take(pop_good, nn.reshape(nn.Tensor.from_const(0), [1]).astype("int32"), axis=0)
+        best_var = self._decode(best_gen)
+        return pop, pop_good, values, best_var, best_value 
     def create_genetic_algorithm(self) -> GeneticAlgorithm:
         return DefaultGeneticAlgorithm()
 
@@ -151,13 +160,13 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
             "forward": {
                 "pop": nn.spec.Tensor([self.config.num_pop, self.config.all_gene_len], self.config.pop_dtype),
                 "$": {
-                    "param_mode": "packed",
+                    "param_mode": "none",
                     "effect_mode": "none",
                 },
             },
             "random_init": {
                 "$": {
-                    "param_mode": "packed",
+                    "param_mode": "none",
                     "effect_mode": "none",
                 },
             },
