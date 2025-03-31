@@ -67,8 +67,14 @@ class ApplyDefaultSchedule:  # pylint: disable=too-few-public-methods
         for g_var, func in mod.functions_items():
             if isinstance(func, tir.PrimFunc) and not _is_scheduled(func):
                 target = _get_target(func)
-
-                sch = _apply_rules(func, target, self.rules, tunable=False)
+                try:
+                    sch = _apply_rules(func, target, self.rules, tunable=False)
+                except Exception as e:  # pylint: disable=broad-except
+                    print(f"Failed to apply rules to {g_var}: {e}")
+                    from tvm.dlight.gpu.fallback import Fallback
+                    fallback_rule = Fallback()
+                    sch = fallback_rule.apply(func, target, False)
+                    sch = [sch]
                 if sch is not None:
                     assert len(sch) == 1
                     updated_functions[g_var] = sch[0].mod["main"].with_attr("tir.is_scheduled", 1)

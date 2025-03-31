@@ -1417,6 +1417,15 @@ def ones(
     """
     return wrap_nested(_op.ones(shape, dtype), name)
 
+def one_hot(
+    indices: Tensor,
+    on_value,
+    off_value,
+    depth,
+    axis = -1,
+    name: str = "one_hot",
+) -> Tensor:
+    return wrap_nested(_op.one_hot(indices._expr, on_value, off_value, depth, axis), name)
 
 def empty(
     shape: Sequence[IntExpr],
@@ -2458,7 +2467,10 @@ def argmax(
     """
     return wrap_nested(_op.argmax(x._expr, axis, keepdims), name=name)
 
-
+def argmin(
+    x: Tensor, axis: Optional[int] = None, keepdims: bool = False, name="argmin"
+):
+    return wrap_nested(_op.argmin(x._expr, axis, keepdims), name=name)
 def topk(
     data: Tensor,
     k: int = 1,

@@ -26,11 +26,25 @@ def test_ga():
     pop = init_func()
     # pop = tvm.nd.array(pop, dev)
     print("init pop", pop)
-    for i in range(1000):
+    best_value = 100000000
+    best_vars = None
+    best_value_unchange_cnt = 0
+    for i in range(10):
         res = forward_func(pop)
         pop = res[0]
-        # print(pop)
-        print(f"[{i}]best value{res[-1]}, vars is {res[-2]}")
+        local_best_value = res[-1].numpy().tolist()[0][0]
+        if local_best_value < best_value:
+            best_value = local_best_value
+            best_vars = res[-2].numpy().tolist()
+            best_value_unchange_cnt = 0
+        else:
+            best_value_unchange_cnt += 1
+        print(f"[{i}]best value {best_value}, vars is {best_vars}")
+        if best_value_unchange_cnt > 100:
+            pop = init_func()
+            best_value_unchange_cnt = 0
+            print("reset pop", flush=True)
+
 
 def test_cross1():
     lib_path = "/home/hz/qzq_work/tvm/outputs/ga.so"

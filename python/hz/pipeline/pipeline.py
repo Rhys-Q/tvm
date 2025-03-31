@@ -4,7 +4,21 @@ import tvm
 from tvm import dlight, relax
 from tvm.relax import register_pipeline
 from tvm.relax.frontend import nn
+from tvm import IRModule
+import logging
+logger = logging.getLogger( "opt_llm" )
+@tvm.transform.module_pass(opt_level=0, name="_LogProgress")
+class _LogProgress:  # pylint: disable=too-few-public-methods
+    """A dummy compiler pass that does nothing but logging."""
 
+    def __init__(self, *args):
+        self.args = args
+
+    def transform_module(self, mod: IRModule, _ctx: tvm.transform.PassContext) -> IRModule:
+        """A dummy transformation"""
+        logger.info(*self.args)
+        print(*self.args, flush=True)
+        return mod
 @register_pipeline("opt_llm")
 def _pipeline(  # pylint: disable=too-many-arguments
     ext_mods: List[nn.ExternModule] = None,
@@ -33,6 +47,7 @@ def _pipeline(  # pylint: disable=too-many-arguments
                 # relax.transform.MetaScheduleTuneIRMod(
                 #     params={}, work_dir=work_dir, max_trials_global=200
                 # ),
+                _LogProgress("Start dlight"),
                 dlight.ApplyDefaultSchedule(
                     dlight.gpu.Matmul(),
                     # dlight.gpu.GEMV(),
@@ -40,6 +55,7 @@ def _pipeline(  # pylint: disable=too-many-arguments
                     dlight.gpu.GeneralReduction(),
                     dlight.gpu.Fallback(),
                 ),
+                _LogProgress("End dlight"),
                 
                 # Phase 5. Lowering to VM bytecode
                 relax.transform.RewriteDataflowReshape(),
@@ -47,13 +63,16 @@ def _pipeline(  # pylint: disable=too-many-arguments
                 relax.transform.RemovePurityChecking(),
                 relax.transform.CallTIRRewrite(),
                 relax.transform.StaticPlanBlockMemory(),
+                _LogProgress("Begin RewriteCUDAGraph"),
                 relax.transform.RewriteCUDAGraph(),
                 relax.transform.LowerAllocTensor(),
                 relax.transform.KillAfterLastUse(),
                 relax.transform.LowerRuntimeBuiltin(),
                 relax.transform.VMShapeLower(),
                 relax.transform.AttachGlobalSymbol(),
+                _LogProgress("Begin AttachExternModules"),
                 relax.transform.AttachExternModules(ext_mods),
+                _LogProgress("Success"),
             ]
         )
         mod = seq(mod)
