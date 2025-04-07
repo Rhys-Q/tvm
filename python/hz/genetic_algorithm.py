@@ -159,10 +159,9 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         return nn.op.concat(encoded_bits, dim=1)
 
     
-    def _cross(self, pop_vars: List[nn.Tensor], fitness: nn.Tensor):
+    def _cross(self, pop_vars: List[nn.Tensor], fitness: nn.Tensor, rand_val_1: nn.Tensor, cross_index: nn.Tensor):
         assert fitness.ndim == 1
         assert self.config.num_cross % 2 == 0
-        num_cross_single = self.config.num_cross // 2
         assert self.same_gene_len
         pop = nn.op.concat(pop_vars, dim=1) # [1000, 96]
         num_var = self.config.num_var # 4
@@ -172,16 +171,12 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         sum_fitness = nn.op.sum(fitness) # [1000]
         fitness = fitness / sum_fitness
         fitness = nn.op.cumsum(fitness)
-        rand_val_1 = self.random([self.config.num_cross,1 ], "float32") #[800, 1]
         flag1 = rand_val_1 <= fitness # [800, 1000]
         flag1 = nn.op.astype(flag1, "uint8")
         selected_index_1 = nn.op.argmax(flag1, axis=1) #[800]
         cross = nn.op.take(pop, selected_index_1, axis=0)  #[800, 4, 24]
         cross_1, cross_2 = nn.op.split(cross, 2, axis=0)
 
-        cross_index = self.random([cross_1.shape[0],cross_1.shape[1], cross_1.shape[2]], "int32", 0, cross_2.shape[2])
-        # index = nn.op.arange(0, cross_1.shape[2]) #[24]
-        # dd =  index < cross_index # [400, 4, 24]
         cross_pop1 = nn.op.where(cross_index > 0, cross_1, cross_2)
         cross_pop2 = nn.op.where(cross_index <= 0, cross_1, cross_2)
         cross_pop = nn.op.concat([cross_pop1, cross_pop2], dim=0) # [800, 4, 24]
@@ -272,7 +267,10 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         values = nn.op.unsqueeze(values, dim=1)
         min_index = nn.op.argmin(values, axis=0)
         # 3. cross
-        pop_cross = self._cross(pop_vars, fitness)
+        cross_val = self.random([self.config.num_cross,1 ], "float32") #[800, 1]
+        cross_index = self.random([self.config.num_cross // 2,self.config.num_var, self.config.gene_lens[0]], "int32", 0, self.config.gene_lens[0])
+
+        pop_cross = self._cross(pop_vars, fitness, cross_val, cross_index)
         # 3. mutate
         pop_mutate = self._mutate_diff(pop_vars)
         pop = nn.op.concat([pop_good, pop_cross, pop_mutate], dim=0)
@@ -284,6 +282,10 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         return pop, pop_good, values, best_var, best_value 
     def create_genetic_algorithm(self) -> GeneticAlgorithm:
         return DefaultGeneticAlgorithm()
+    
+    def debug_cross(self, pop: nn.Tensor, fitness: nn.Tensor, cross_val: nn.Tensor, cross_index: nn.Tensor):
+        pop_vars = nn.op.split(pop, self.config.gene_split, axis=1)
+        return self._cross(pop_vars, fitness, cross_val, cross_index)
 
     def get_default_spec(self):
         mod_spec = {
@@ -300,13 +302,15 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
                     "effect_mode": "none",
                 },
             },
-            # "debug_cross": {
-            #     "pop": nn.spec.Tensor([self.config.num_pop, self.config.all_gene_len], self.config.pop_dtype),
-            #     "fitness": nn.spec.Tensor([self.config.num_pop ], "float32"),
-            #     "$": {
-            #         "param_mode": "none",
-            #         "effect_mode": "none",
-            #     },
-            # },
+            "debug_cross": {
+                "pop": nn.spec.Tensor([self.config.num_pop, self.config.all_gene_len], self.config.pop_dtype),
+                "fitness": nn.spec.Tensor([self.config.num_pop ], "float32"),
+                "cross_val": nn.spec.Tensor([self.config.num_cross,1 ], "float32"),
+                "cross_index": nn.spec.Tensor([self.config.num_cross // 2,self.config.num_var, self.config.gene_lens[0]], "int32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
         }
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)
