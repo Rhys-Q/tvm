@@ -58,7 +58,10 @@ class Random(nn.Module):
         self, size, dtype, low=0, high=1
     ):  # pylint: disable=invalid-name
         if dtype == "float32":
-            return self._get_ext_mod()["relax_random_cuda"](size, dtype)
+            if low == 0 and high == 1:
+                return self._get_ext_mod()["relax_random_cuda"](size, dtype)
+            else:
+                return self._get_ext_mod()["relax_random_cuda"](size, dtype) * (high - low) + low
         elif dtype == "int32":
             random_value = self._get_ext_mod()["relax_random_cuda"](size, "float32")
             value = random_value * (high - low) + low

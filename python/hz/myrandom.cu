@@ -50,7 +50,6 @@ int RandomFunction(Array<tvm::Integer> shape, DLTensor* out) {
   using namespace tvm::runtime;
 
   // 1. 构造 shape 向量
-  LOG(INFO) << "shape: " << shape;
   std::vector<int64_t> shape_vec;
   int64_t total = 1;
   for (const auto& s : shape) {
@@ -68,7 +67,6 @@ int RandomFunction(Array<tvm::Integer> shape, DLTensor* out) {
 
 namespace {
 int external_random_cuda(Array<Integer> size, String out_dtype, DLTensor* out) {
-  LOG(INFO) << out_dtype;
   RandomFunction(size, out);
 
   return 0;

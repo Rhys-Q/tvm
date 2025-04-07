@@ -29,7 +29,7 @@ def test_ga():
     best_value = 100000000
     best_vars = None
     best_value_unchange_cnt = 0
-    for i in range(10):
+    for i in range(100):
         res = forward_func(pop)
         pop = res[0]
         local_best_value = res[-1].numpy().tolist()[0][0]
@@ -43,7 +43,7 @@ def test_ga():
         if best_value_unchange_cnt > 100:
             pop = init_func()
             best_value_unchange_cnt = 0
-            print("reset pop", flush=True)
+            # print("reset pop", flush=True)
 
 
 def test_cross1():
@@ -58,7 +58,7 @@ def test_cross1():
     out = cross_func(pop, fitness_tvm)
     out_np = fitness /  np.sum(fitness)
     out_np = np.cumsum(out_np)
-    breakpoint()
-    pass
+
+
 if __name__ == "__main__":
     test_ga()
