@@ -29,7 +29,7 @@ def test_ga():
     best_value = 100000000
     best_vars = None
     best_value_unchange_cnt = 0
-    for i in range(100):
+    for i in range(300):
         res = forward_func(pop)
         pop = res[0]
         local_best_value = res[-1].numpy().tolist()[0][0]
@@ -88,6 +88,95 @@ def test_cross():
     np_out = cross_numpy(pop, fitness, cross_val, cross_index)
     np.testing.assert_allclose(out_tvm, np_out, rtol=1e-05, atol=1e-05)
 
+def test_decode():
+    lib_path = "/home/hz/qzq_work/tvm/outputs/ga.so"
+    dev = tvm.cuda(0)
+    vm = load_ga_model(lib_path, dev)
+    cross_func = vm["debug_decode"]
+    pop = np.random.randint(0, 2, (1000, 96)).astype(np.int32)
+    pop_tvm = tvm.nd.array(pop, dev)
+    out_tvm = cross_func(pop_tvm)
+    out_tvm = out_tvm.numpy()
+    assert np.all(out_tvm >0)
+
+    def decode_numpy(pop):
+        vars = np.split(pop, 4, axis=1)
+        decode_vars = []
+        for i in range(4):
+            powers_of_two = 2 ** np.arange(24)[::-1]
+            int_values = vars[i].astype("int32") * powers_of_two
+            int_values = np.sum(int_values, axis=1)
+            float_values = int_values.astype("float32") * 1e-5  +0
+            float_values = np.expand_dims(float_values, axis=1)
+            decode_vars.append(float_values)
+        return np.concat(decode_vars, axis=1)
+
+    np_out = decode_numpy(pop)
+    np.testing.assert_allclose(out_tvm, np_out, rtol=1e-05, atol=1e-05)
+
+def test_encode():
+    lib_path = "/home/hz/qzq_work/tvm/outputs/ga.so"
+    dev = tvm.cuda(0)
+    vm = load_ga_model(lib_path, dev)
+    encode_func = vm["_encode"]
+    np.random.seed(0)
+    vars = np.random.random((1000, 4)).astype(np.float32) * 100
+    vars_tvm = tvm.nd.array(vars, dev)
+    tvm_out = encode_func(vars_tvm)
+    # tvm_out = tvm_out.numpy()
+
+    def encode_numpy(vars):
+        var_list = np.split(vars, 4, axis=1)
+
+    
+        encoded_bits = []
+        for i in range(4):
+            # Extract current variable
+            var_i = var_list[i] # [1000, 1]
+            min_val = 0
+            max_val = 100
+            gene_len = 24
+            eps = 1e-5
+
+            # Step 1: Clip values to valid range
+            clipped_var = np.clip(var_i, min_val, max_val) # [1000, 1]
+            
+            # Step 2: Normalize to [0, 1] and scale to integer range
+            normalized = clipped_var - min_val
+            scaled = normalized.astype("float64") / eps
+            scaled =  np.round(scaled).astype("int32")
+            int_val = scaled
+            powers = 2 ** np.arange(gene_len-1, -1, -1, dtype="int32")
+            powers = np.reshape(powers,[1, -1]).astype("int32")
+
+            expanded_int = np.reshape(int_val, (-1, 1))  # Ensure 2D tensor [1000, 1]
+            div = np.divide(expanded_int, powers).astype("int32")
+
+
+            bits = np.mod(div, 2)
+
+            # Step 4: Convert to float32 and store
+            encoded_bits.append(bits.astype("int32"))
+
+        # Concatenate all binary segments
+        return np.concat(encoded_bits, axis=1)
+    
+    np_out = encode_numpy(vars)
+    np.testing.assert_allclose(tvm_out.numpy(), np_out)
+
+def test_encode_decode():
+    lib_path = "/home/hz/qzq_work/tvm/outputs/ga.so"
+    dev = tvm.cuda(0)
+    vm = load_ga_model(lib_path, dev)
+    decode_func = vm["debug_decode"]
+    encode_func = vm["_encode"]
+    np.random.seed(0)
+    vars = np.random.random((1000, 4)).astype(np.float32) * 100
+    vars_tvm = tvm.nd.array(vars, dev)
+    tvm_out = encode_func(vars_tvm)
+
+    tvm_decode = decode_func(tvm_out)
+    np.testing.assert_allclose(vars, tvm_decode.numpy(), atol=1e-05)
 
 if __name__ == "__main__":
-    test_cross()
+    test_ga()

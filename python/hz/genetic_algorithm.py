@@ -113,10 +113,14 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
             powers_of_two = nn.Tensor.from_const(powers_of_two.astype("int32"))
             int_values = vars[i].astype("int32") * powers_of_two
             int_values = nn.op.sum(int_values, axis=1)
-            float_values = int_values.astype("float32") / (2 ** self.config.gene_lens[i] -1 ) * (self.config.max_values[i] - self.config.min_values[i]) + self.config.min_values[i]
+            float_values = int_values.astype("float32")*  self.config.eps[i] + self.config.min_values[i]
             float_values = nn.op.unsqueeze(float_values, dim=1)
             decode_vars.append(float_values)
         return nn.op.concat(decode_vars, dim=1)
+    
+    def debug_decode(self, pop: nn.Tensor):
+        pop_vars = nn.op.split(pop, self.config.gene_split, axis=1)
+        return self._decode(pop_vars)
 
     def _encode(self, vars: nn.Tensor) -> nn.Tensor:
         # Split input tensor into individual variables if necessary
@@ -132,19 +136,21 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
             min_val = self.config.min_values[i]
             max_val = self.config.max_values[i]
             gene_len = self.config.gene_lens[i]
+            eps = self.config.eps[i]
 
             # Step 1: Clip values to valid range
             clipped_var = nn.op.clip(var_i, min_val, max_val) # [1000, 1]
             
             # Step 2: Normalize to [0, 1] and scale to integer range
-            normalized = (clipped_var - min_val) / (max_val - min_val)
-            scaled = normalized * (2 ** gene_len - 1)
-            int_val = nn.op.round(scaled).astype("int32")
+            normalized = clipped_var - min_val
+            scaled = nn.op.divide(normalized.astype("float64") , nn.Tensor.from_scalar(eps, dtype="float64"))
+            scaled = nn.op.round(scaled).astype("int32")
+            int_val = scaled
 
             # Step 3: Generate binary representation
             # Create powers of two tensor (MSB first)
             powers = 2 ** np.arange(gene_len-1, -1, -1, dtype="int32")
-            powers_tensor = nn.Tensor.from_const(powers.reshape(1, -1)) # [1, gene_len]
+            powers_tensor = nn.Tensor.from_const(powers.reshape(1, -1)).astype("int32") # [1, gene_len]
 
             # Calculate binary bits using bitwise operations
             expanded_int = nn.op.reshape(int_val, (-1, 1))  # Ensure 2D tensor [1000, 1]
@@ -157,8 +163,6 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
 
         # Concatenate all binary segments
         return nn.op.concat(encoded_bits, dim=1)
-
-    
     def _cross(self, pop_vars: List[nn.Tensor], fitness: nn.Tensor, rand_val_1: nn.Tensor, cross_index: nn.Tensor):
         assert fitness.ndim == 1
         assert self.config.num_cross % 2 == 0
@@ -247,7 +251,6 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
             dd2 = nn.op.unsqueeze(dd1, dim=1)
             dd2 = nn.op.broadcast_to(dd2, vars.shape) # [100, 4]
             vars = nn.op.where(dd2, vars, new_vars)
-            # fitness_good = nn.op.where(dd1, fitness_good, new_fitness)
             fitness_good = nn.op.minimum(fitness_good, new_fitness)
         
         pop_good = self._encode(vars)
@@ -277,7 +280,6 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
         # best
         best_value = nn.op.take(values, min_index, axis=0)
         best_gen = nn.op.take(pop_good, min_index, axis=0)
-        # best_gen = nn.op.unsqueeze(best_gen, dim=0)
         best_var = self._decode(best_gen)
         return pop, pop_good, values, best_var, best_value 
     def create_genetic_algorithm(self) -> GeneticAlgorithm:
@@ -307,6 +309,20 @@ class GeneticAlgorithmWarp(nn.Module):  # pylint: disable=too-many-instance-attr
                 "fitness": nn.spec.Tensor([self.config.num_pop ], "float32"),
                 "cross_val": nn.spec.Tensor([self.config.num_cross,1 ], "float32"),
                 "cross_index": nn.spec.Tensor([self.config.num_cross // 2,self.config.num_var, self.config.gene_lens[0]], "int32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "debug_decode": {
+                "pop": nn.spec.Tensor([self.config.num_pop, self.config.all_gene_len], self.config.pop_dtype),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "_encode": {
+                "vars": nn.spec.Tensor([self.config.num_pop, self.config.num_var], "float32"),
                 "$": {
                     "param_mode": "none",
                     "effect_mode": "none",
