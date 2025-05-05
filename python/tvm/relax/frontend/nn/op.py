@@ -642,6 +642,11 @@ def minimum(x1: Tensor, x2: Tensor, name: str = "minimum"):
     """
     return wrap_nested(_op.minimum(x1._expr, x2._expr), name)
 
+def min(x: Tensor, axis ,keepdims, name: str = "min"):
+    return wrap_nested(_op.min(x._expr, axis=axis, keepdims=keepdims), name)
+
+def max(x: Tensor, axis ,keepdims, name: str = "max"):
+    return wrap_nested(_op.max(x._expr, axis=axis, keepdims=keepdims), name)
 
 def broadcast_to(x: Tensor, shape: Sequence[IntExpr], name: str = "broadcast_to") -> Tensor:
     """Broadcasts a tensor to a specified shape.
