@@ -120,9 +120,21 @@ class ColorMatch(nn.Module):
         c1_0 = nn.op.unsqueeze(c1, dim=2) # [B, 31, 1]
         tmp3 = c1_0 > ind
         ind_c1 = nn.op.argmax(tmp3, axis=2).astype("int32") # [B, 31]
-        reflict_1 = nn.op.take(self.alldata_reflection, self.rank1, axis=0) # [31, REF_DIM, 31]
+
+        def take_reflection(data, rank):
+            t = nn.op.tensor_expr_op(
+                lambda data, rank: te.compute(
+                    [rank.shape[0], data.shape[1]],
+                    lambda i, j:  data[rank[i], j, i],
+                    name="cal_line",
+                ),
+                "cal_line",
+                args=[data, rank],
+                ) # [B, 31]
+            return t
+        reflict_1 = take_reflection(self.alldata_reflection, self.rank1)# [31, REF_DIM]
         def cal_line(reflict_1, ind_1,c1, ind_c1, i, j):
-            # reflict_1: [31, REF_DIM, 31]
+            # reflict_1: [31, REF_DIM]
             # ind_1: [31, REF_DIM]
             # c1: [B, 31]
             # ind_c1: [B, 31]
@@ -139,8 +151,8 @@ class ColorMatch(nn.Module):
             ind_index = ind_c1[i, j]
             num = reflict_1.shape[1]
             return _tir.Select( ind_index == 0, _tir.const(0, "float32"), 
-                        _tir.Select(ind_index == num-1,reflict_1[j, num-1, j], 
-                            cal_line_intern(reflict_1[j,ind_index,j],reflict_1[j,ind_index-1,j],    ind_1[j, ind_index],ind_1[j, ind_index-1],c1[i,j] )
+                        _tir.Select(ind_index == num-1,reflict_1[j, num-1], 
+                            cal_line_intern(reflict_1[j,ind_index],reflict_1[j,ind_index-1],    ind_1[j, ind_index],ind_1[j, ind_index-1],c1[i,j] )
                         )
                     )
             
@@ -153,7 +165,16 @@ class ColorMatch(nn.Module):
             ),
             "cal_line",
             args=[reflict_1, ind_0,c1, ind_c1],
-        )
+        ) # [B, 31]
+
+        reflict_2 = take_reflection(self.alldata_reflection, self.rank2) # [31, REF_DIM]
+        tmp = nn.unsqueeze(r1, dim=2) > nn.unsqueeze(reflict_2, dim=0)
+        index_r1 = nn.op.argmax(tmp, axis=2).astype("int32") # [B, 31]
+
+
+
+
+        
 
         return r1
 
