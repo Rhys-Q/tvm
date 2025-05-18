@@ -5,6 +5,7 @@ from tvm.relax.frontend import nn
 import numpy as np
 from tvm.relax.frontend.nn import spec
 from tvm import tir as _tir
+import torch
 class ColorConfig():
     def __init__(self, data_path = "/home/hz/qzq_work/color_train_dataset/data/BaseData_3009", systemid=1, matnumbers: list[int]= [0, 1, 12,21]):
         self.systemid = systemid
@@ -217,6 +218,7 @@ class ColorMatch(nn.Module):
             args=[self.reflect_rank1, self.ind_rank1,c1, ind_index_c1],
         ) # [B, 31]
 
+
         def cal_index_in_reflection(reflict, r):
             # reflect: [31, IND_DIM]
             # r: [B, 31]
@@ -234,6 +236,8 @@ class ColorMatch(nn.Module):
             args=[self.reflect_rank2, self.ind_rank2,r1, index_r1],
         ) # [B, 31]
 
+
+
         # C2
         def cal_C2():
             KValue = self.k1_rank2 # [31]
@@ -249,7 +253,7 @@ class ColorMatch(nn.Module):
                 args=[self.w_reflection_rank1, self.w_concentration_rank1,KR2And3, index_w],
             ) # [B, 31]
             C2_1 = ((vars0+ vars1 * w2)/(1- M3 ) - vars0 - vars1* w2 + vars2)
-            C2_2 = (vars0 + vars1 * w2) / (1 - M3 + vars2)
+            C2_2 = (vars0 + vars1 * w2) / (1 - M3) + vars2
             C2 = C2_1 / C2_2
             return C2
 
@@ -257,6 +261,7 @@ class ColorMatch(nn.Module):
 
         # 计算R2
         index_c2 = cal_index_in_ind(self.ind_rank2, C2) #[B, 31]
+
         R2 = nn.op.tensor_expr_op(
             lambda reflict, ind,c, index: te.compute(
                 index.shape,
@@ -331,5 +336,9 @@ if __name__ == "__main__":
     config = ColorConfig()
 
     cm = ColorMatch(config)
-    forward_spec = {"color_match": {"vars": spec.Tensor([10, 4], dtype="float32")}}
-    cm.jit(forward_spec, debug=True)
+    forward_spec = {"color_match": {"vars": spec.Tensor(['B', 4], dtype="float32")}}
+    model = cm.jit(forward_spec, debug=True)
+    input_tensor = torch.tensor([10,10,10,10], dtype=torch.float32).reshape(1,4)
+    func = model['color_match']
+    output = func(input_tensor)
+    print(output)
