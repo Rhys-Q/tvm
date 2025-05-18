@@ -21,7 +21,7 @@ class ColorMatch(nn.Module):
 
         self.alldata_concentration = nn.Tensor.from_const(alldata_concentration) # [4, 1090]
         self.alldata_reflection = nn.Tensor.from_const(alldata_reflection)       # [4, 1090, 31]
-        self.k1_concentration = nn.Tensor.from_const(k1_concentration)           # [4, 1]
+        # self.k1_concentration = nn.Tensor.from_const(k1_concentration)           # [4, 1]
         self.k1_reflection = nn.Tensor.from_const(k1_reflection)                 # [4, 1, 31]
         self.w_concentration = nn.Tensor.from_const(w_concentration)             # [4, 658]
         self.w_reflection = nn.Tensor.from_const(w_reflection)                   # [4, 658, 31]
@@ -33,6 +33,46 @@ class ColorMatch(nn.Module):
         self.rank1 = nn.Tensor.from_const(rank_index[1])
         self.rank2 = nn.Tensor.from_const(rank_index[2])
         self.rank3 = nn.Tensor.from_const(rank_index[3])
+
+        # concentration
+        self.ind_rank0 = nn.Tensor.from_const(np.take(alldata_concentration, rank_index[0], axis=0))
+        self.ind_rank1 = nn.Tensor.from_const(np.take(alldata_concentration, rank_index[1], axis=0))
+        self.ind_rank2 = nn.Tensor.from_const(np.take(alldata_concentration, rank_index[2], axis=0))
+        self.ind_rank3 = nn.Tensor.from_const(np.take(alldata_concentration, rank_index[3], axis=0))
+
+        # reflect
+        def take_reflection(data, rank):
+            # data: [4, IND_DIM, 31]
+            # rank: [31]
+            return data[rank[:, np.newaxis], np.arange(data.shape[1]), np.arange(31)[:, np.newaxis]]
+        self.reflect_rank0 = nn.Tensor.from_const(take_reflection(alldata_reflection, rank_index[0]))
+        self.reflect_rank1 = nn.Tensor.from_const(take_reflection(alldata_reflection, rank_index[1]))
+        self.reflect_rank2 = nn.Tensor.from_const(take_reflection(alldata_reflection, rank_index[2]))
+        self.reflect_rank3 = nn.Tensor.from_const(take_reflection(alldata_reflection, rank_index[3]))
+
+        # K1
+        def extract_k1_reflection(k1_reflection, rank):
+            k1_rank = np.zeros([31], dtype=np.float32)
+            for i in range(31):
+                k1_rank[i] = k1_reflection[rank[i], 0, i]
+            return k1_rank
+
+        self.k1_rank0 = nn.Tensor.from_const(extract_k1_reflection(k1_reflection, rank_index[0]))
+        self.k1_rank1 = nn.Tensor.from_const(extract_k1_reflection(k1_reflection, rank_index[1]))
+        self.k1_rank2 = nn.Tensor.from_const(extract_k1_reflection(k1_reflection, rank_index[2]))
+        self.k1_rank3 = nn.Tensor.from_const(extract_k1_reflection(k1_reflection, rank_index[3]))
+
+        # W
+        self.w_concentration_rank0 = nn.Tensor.from_const(np.take(w_concentration, rank_index[0], axis=0))
+        self.w_concentration_rank1 = nn.Tensor.from_const(np.take(w_concentration, rank_index[1], axis=0))
+        self.w_concentration_rank2 = nn.Tensor.from_const(np.take(w_concentration, rank_index[2], axis=0))
+        self.w_concentration_rank3 = nn.Tensor.from_const(np.take(w_concentration, rank_index[3], axis=0))
+
+        self.w_reflection_rank0 = nn.Tensor.from_const(take_reflection(w_reflection, rank_index[0]))
+        self.w_reflection_rank1 = nn.Tensor.from_const(take_reflection(w_reflection, rank_index[1]))
+        self.w_reflection_rank2 = nn.Tensor.from_const(take_reflection(w_reflection, rank_index[2]))
+        self.w_reflection_rank3 = nn.Tensor.from_const(take_reflection(w_reflection, rank_index[3]))
+
 
     
     
@@ -107,35 +147,34 @@ class ColorMatch(nn.Module):
     def color_match(self, vars: nn.Tensor):
         # https://gitee.com/qzqbiubiubiu/cal_color/blob/master/src/cal_color/color4.cc
         # vars shape is [B, 4]
+        # IND_DIM is the num of ind, which is 1090 in this case
         sum_vars = nn.op.sum(vars, axis=1, keepdims=True) # [B, 1]
         vars = vars / sum_vars * 100
         # the first step
-        tmp1 = nn.op.take(vars, self.rank0, axis=1)
-        tmp2 = nn.op.take(vars, self.rank1, axis=1)
-        c1 = tmp2 / (tmp1 + tmp2) # [B, 31]
+        vars0 = nn.op.take(vars, self.rank0, axis=1)
+        vars1 = nn.op.take(vars, self.rank1, axis=1)
+        vars2 = nn.op.take(vars, self.rank2, axis=1)
+        vars3 = nn.op.take(vars, self.rank3, axis=1)
 
+        # W
+        c1 = vars1 / (vars1 + vars0) # [B, 31]
 
-        ind_0 = nn.op.take(self.alldata_concentration, self.rank1, axis=0) # [31, IND_DIM]
-        ind = nn.op.unsqueeze(ind_0, dim=0) # [1, 31, IND_DIM]
-        c1_0 = nn.op.unsqueeze(c1, dim=2) # [B, 31, 1]
-        tmp3 = c1_0 > ind
-        ind_c1 = nn.op.argmax(tmp3, axis=2).astype("int32") # [B, 31]
+        def cal_index_in_ind(ind_rank, c):
+            # ind_rank0: [31, IND_DIM]
+            # c: [B, 31]
+            ind = nn.op.unsqueeze(ind_rank, dim=0) # [1, 31, IND_DIM]
+            c = nn.op.unsqueeze(c, dim=2) # [B, 31, 1]
+            tmp = c <= ind
+            ind = nn.op.argmax(tmp, axis=2).astype("int32") # [B, 31]
+            return ind
 
-        def take_reflection(data, rank):
-            t = nn.op.tensor_expr_op(
-                lambda data, rank: te.compute(
-                    [rank.shape[0], data.shape[1]],
-                    lambda i, j:  data[rank[i], j, i],
-                    name="cal_line",
-                ),
-                "cal_line",
-                args=[data, rank],
-                ) # [B, 31]
-            return t
-        reflict_1 = take_reflection(self.alldata_reflection, self.rank1)# [31, REF_DIM]
+        
+        ind_index_c1 = cal_index_in_ind(self.ind_rank1, c1) # [B, 31]
+
         def cal_line(reflict_1, ind_1,c1, ind_c1, i, j):
-            # reflict_1: [31, REF_DIM]
-            # ind_1: [31, REF_DIM]
+            # 根据浓度算曲线
+            # reflict_1: [31, IND_DIM]
+            # ind_1: [31, IND_DIM]
             # c1: [B, 31]
             # ind_c1: [B, 31]
             # i [0, B)
@@ -149,13 +188,24 @@ class ColorMatch(nn.Module):
                 return v1 - (v1-v2)/(ind1 - ind2) * (ind1 - w)
             
             ind_index = ind_c1[i, j]
-            num = reflict_1.shape[1]
-            return _tir.Select( ind_index == 0, _tir.const(0, "float32"), 
-                        _tir.Select(ind_index == num-1,reflict_1[j, num-1], 
-                            cal_line_intern(reflict_1[j,ind_index],reflict_1[j,ind_index-1],    ind_1[j, ind_index],ind_1[j, ind_index-1],c1[i,j] )
-                        )
+            return _tir.Select( ind_index == 0, reflict_1[j, 0], 
+                            cal_line_intern(reflict_1[j,ind_index],reflict_1[j,ind_index-1], ind_1[j, ind_index],ind_1[j, ind_index-1],c1[i,j] )
                     )
+
+        def cal_concentration(reflict, ind , r, ind_r, i, j):
+            # reflict: [31, IND_DIM]
+            # ind: [31, IND_DIM]
+            # r: [B, 31]
+            # ind_r: [B, 31]
+            # i [0, B)
+            # j [0, 31)
+            def cal_concentration_intern(ind1, ind2, v1, v2, w):
+                return ind1 - (ind1 - ind2)/(v1-v2) * (v1 - w)
             
+            ind_index = ind_r[i, j]
+            return _tir.Select( ind_index == 0, ind[j, 0], 
+                cal_concentration_intern(ind[j, ind_index-1], ind[j, ind_index], reflict[j,ind_index-1], reflict[j,ind_index], r[i,j])
+            )
 
         r1 = nn.op.tensor_expr_op(
             lambda reflict_1, ind_1,c1, ind_c1: te.compute(
@@ -164,20 +214,114 @@ class ColorMatch(nn.Module):
                 name="cal_line",
             ),
             "cal_line",
-            args=[reflict_1, ind_0,c1, ind_c1],
+            args=[self.reflect_rank1, self.ind_rank1,c1, ind_index_c1],
         ) # [B, 31]
 
-        reflict_2 = take_reflection(self.alldata_reflection, self.rank2) # [31, REF_DIM]
-        tmp = nn.unsqueeze(r1, dim=2) > nn.unsqueeze(reflict_2, dim=0)
-        index_r1 = nn.op.argmax(tmp, axis=2).astype("int32") # [B, 31]
+        def cal_index_in_reflection(reflict, r):
+            # reflect: [31, IND_DIM]
+            # r: [B, 31]
+            tmp = nn.unsqueeze(r, dim=2) >= nn.unsqueeze(reflict, dim=0)
+            index = nn.op.argmax(tmp, axis=2).astype("int32") # [B, 31]
+            return index
+        index_r1 = cal_index_in_reflection(self.reflect_rank2, r1) # [B, 31]
+        M3 = nn.op.tensor_expr_op(
+            lambda reflict, ind,r, ind_r: te.compute(
+                ind_r.shape,
+                lambda i, j:  cal_concentration(reflict, ind,r, ind_r, i, j),
+                name="cal_concentration",
+            ),
+            "cal_concentration",
+            args=[self.reflect_rank2, self.ind_rank2,r1, index_r1],
+        ) # [B, 31]
 
+        # C2
+        def cal_C2():
+            KValue = self.k1_rank2 # [31]
+            KR2And3 = KValue * vars2 / (KValue *vars2 + vars1) # [B, 31]
+            index_w = cal_index_in_ind(self.w_concentration_rank1, KR2And3) #  [B, 31]
+            w2 = nn.op.tensor_expr_op(
+                lambda reflict_1, ind_1,c1, ind_c1: te.compute(
+                    ind_c1.shape,
+                    lambda i, j:  cal_line(reflict_1, ind_1,c1, ind_c1, i, j),
+                    name="cal_line",
+                ),
+                "cal_line",
+                args=[self.w_reflection_rank1, self.w_concentration_rank1,KR2And3, index_w],
+            ) # [B, 31]
+            C2_1 = ((vars0+ vars1 * w2)/(1- M3 ) - vars0 - vars1* w2 + vars2)
+            C2_2 = (vars0 + vars1 * w2) / (1 - M3 + vars2)
+            C2 = C2_1 / C2_2
+            return C2
 
+        C2 = cal_C2()
 
+        # 计算R2
+        index_c2 = cal_index_in_ind(self.ind_rank2, C2) #[B, 31]
+        R2 = nn.op.tensor_expr_op(
+            lambda reflict, ind,c, index: te.compute(
+                index.shape,
+                lambda i, j:  cal_line(reflict, ind,c, index, i, j),
+                name="cal_line",
+            ),
+            "cal_line",
+            args=[self.reflect_rank2, self.ind_rank2,C2, index_c2],
+        ) # [B, 31]
 
-        
+        # 计算M4
+        index_R2 = cal_index_in_reflection(self.reflect_rank3, R2) # [B, 31]
+        M4 = nn.op.tensor_expr_op(
+            lambda reflict, ind,r, ind_r: te.compute(
+                ind_r.shape,
+                lambda i, j:  cal_concentration(reflict, ind,r, ind_r, i, j),
+                name="cal_concentration",
+            ),
+            "cal_concentration",
+            args=[self.reflect_rank3, self.ind_rank3,R2, index_R2],
+        ) # [B, 31]
 
-        return r1
+        def cal_C3():
+            KValue = self.k1_rank3 # [31]
+            KR2And4 = KValue* vars3 / (vars1+ vars3 * KValue)# [B, 31]
+            KR3And4 = KValue * vars3 / (KValue *vars3 + vars2) # [B, 31]
+            index_w2_4 = cal_index_in_ind(self.w_concentration_rank1, KR2And4) #  [B, 31]
+            index_w3_4 = cal_index_in_ind(self.w_concentration_rank2, KR3And4) #  [B, 31]
+            w2_4 = nn.op.tensor_expr_op(
+                lambda reflict_1, ind_1,c1, ind_c1: te.compute(
+                    ind_c1.shape,
+                    lambda i, j:  cal_line(reflict_1, ind_1,c1, ind_c1, i, j),
+                    name="cal_line",
+                ),
+                "cal_line",
+                args=[self.w_reflection_rank1, self.w_concentration_rank1,KR2And4, index_w2_4],
+            ) # [B, 31]
+            w3_4 = nn.op.tensor_expr_op(
+                lambda reflict_1, ind_1,c1, ind_c1: te.compute(
+                    ind_c1.shape,
+                    lambda i, j:  cal_line(reflict_1, ind_1,c1, ind_c1, i, j),
+                    name="cal_line",
+                ),
+                "cal_line",
+                args=[self.w_reflection_rank2, self.w_concentration_rank2,KR3And4, index_w3_4],
+            ) # [B, 31]
 
+            C3_1 =((vars0 + vars1* w2_4 + vars2* w3_4) / (1 - M4) - vars0 - vars1* w2_4 - vars2* w3_4 + vars3)
+            C3_2 = ((vars0 + vars1* w2_4 + vars2* w3_4)/(1-M4) +  vars3)
+            C3 = (C3_1 / C3_2)
+            return C3
+        C3 = cal_C3()
+
+        # R3
+        index_c3 = cal_index_in_ind(self.ind_rank3, C3) #[B, 31]
+        R3 = nn.op.tensor_expr_op(
+            lambda reflict, ind,c, index: te.compute(
+                index.shape,
+                lambda i, j:  cal_line(reflict, ind,c, index, i, j),
+                name="cal_line",
+            ),
+            "cal_line",
+            args=[self.reflect_rank3, self.ind_rank3,C3, index_c3],
+        ) # [B, 31]
+        return R3
 
 
 
