@@ -338,7 +338,7 @@ if __name__ == "__main__":
     cm = ColorMatch(config)
     forward_spec = {"color_match": {"vars": spec.Tensor(['B', 4], dtype="float32")}}
     model = cm.jit(forward_spec, debug=True)
-    input_tensor = torch.tensor([10,10,10,10], dtype=torch.float32).reshape(1,4)
+    input_tensor = torch.tensor([[10,10,10,10],[20,30,20,30]], dtype=torch.float32).reshape(2,4)
     func = model['color_match']
     output = func(input_tensor)
     print(output)
