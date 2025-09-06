@@ -39,9 +39,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         self.env: Dict[fx.Node, relax.Expr] = {}
         self.params: Dict[torch.Tensor, relax.Expr] = {}
         self.block_builder: relax.BlockBuilder = None
-        self.convert_map: Dict[
-            Union[torch.nn.Module, str], Callable[[fx.Node], relax.Var]
-        ] = self.create_convert_map()
+        self.convert_map: Dict[Union[torch.nn.Module, str], Callable[[fx.Node], relax.Var]] = (
+            self.create_convert_map()
+        )
 
     ########## Utilities ##########
 
@@ -1714,6 +1714,12 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         indices = self.block_builder.emit(relax.op.astype(indices, "int32"))
         return self.block_builder.emit(relax.op.take(x, indices))
 
+    def _take_along_dim(self, node: fx.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        indices = self.env[node.args[1]]
+        indices = self.block_builder.emit(relax.op.astype(indices, "int32"))
+        return self.block_builder.emit(relax.op.take(x, indices))
+
     def _tile(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
 
@@ -1934,9 +1940,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         size = (
             args[1]
             if isinstance(args[1], (list, tuple))
-            else (args[1],)
-            if len(args[1:]) == 1
-            else args[1:]
+            else (args[1],) if len(args[1:]) == 1 else args[1:]
         )
         size = relax.ShapeExpr(size)
         return self.block_builder.emit(
@@ -2080,6 +2084,23 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _zeros_like(self, node: fx.node) -> relax.Var:
         x = self.env[node.args[0]]
         return self.block_builder.emit(relax.op.zeros_like(x))
+
+    # rand
+    def _rand(self, node: fx.Node) -> relax.Var:
+        import torch
+
+        args = self.retrieve_args(node)
+        size = relax.ShapeExpr(args[0] if isinstance(args[0], (list, tuple)) else (args[0],))
+        dtype = self._convert_data_type(
+            node.kwargs.get("dtype", torch.get_default_dtype()), self.env
+        )
+        return self.block_builder.emit(
+            relax.op.full(
+                size,
+                relax.const(1, dtype),
+                dtype,
+            )
+        )
 
     @abc.abstractmethod
     def create_convert_map(

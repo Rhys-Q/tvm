@@ -329,6 +329,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             )
         )
 
+    def _assert_tensor_metadata(self, node: fx.Node):
+        args = self.retrieve_args(node)
+        x = args[0]
+        return self.block_builder.emit(x)
+
     ########## Others ##########
 
     def create_convert_map(
@@ -438,6 +443,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "min.other": self._binary_op(relax.op.minimum, min),
             "max.default": self._unary_op(relax.op.max),
             "min.default": self._unary_op(relax.op.min),
+            "minimum.default": self._binary_op(relax.op.minimum, min),
             "remainder.Tensor": self._binary_op(relax.op.floor_mod, operator.mod),
             "remainder.Scalar": self._binary_op(relax.op.floor_mod, operator.mod),
             "mul.Tensor": self._binary_op(relax.op.multiply, operator.mul),
@@ -508,6 +514,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "argmin.default": self._argmax_argmin(relax.op.argmin),
             "where.self": self._where,
             "bucketize.Tensor": self._bucketize,
+            "searchsorted.Tensor": self._bucketize,
             # tensor manipulation
             "argsort.default": self._argsort,
             "broadcast_to.default": self._broadcast_to,
@@ -533,6 +540,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "roll.default": self._roll,
             "select.int": self._select,
             "slice.Tensor": self._slice,
+            "slice_copy.Tensor": self._slice,
             "slice_scatter.default": self._slice_scatter,
             "sort.default": self._sort,
             "split.Tensor": self._split,
@@ -541,6 +549,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "squeeze.dim": self._squeeze,
             "stack.default": self._stack,
             "take.default": self._take,
+            "take_along_dim.default": self._take_along_dim,
             "tile.default": self._tile,
             "topk.default": self._topk,
             "transpose.int": self._transpose,
@@ -587,6 +596,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "zero_.default": self._zeros_inplace,
             "zeros.default": self._zeros,
             "zeros_like.default": self._zeros_like,
+            # random
+            "rand.default": self._rand,
+            "randint.low": self._rand,
             # datatype
             "to.dtype": self._to,
             "to.dtype_layout": self._to,
@@ -594,6 +606,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # other
             "getitem": self._getitem,
             "item.default": self._item,
+            "_assert_tensor_metadata.default": self._assert_tensor_metadata,
         }
 
     def create_input_vars(
@@ -611,20 +624,60 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 torch_dtype = exported_program.tensor_constants[spec.target].dtype
             elif spec.kind is torch.export.graph_signature.InputKind.USER_INPUT:
                 for node in exported_program.graph.find_nodes(op="placeholder", target=spec.target):
-                    if node.name == name_hint and "tensor_meta" in node.meta:
-                        torch_shape = node.meta["tensor_meta"].shape
-                        torch_dtype = node.meta["tensor_meta"].dtype
+                    if node.name == name_hint:
+                        if "tensor_meta" in node.meta:
+                            torch_shape = node.meta["tensor_meta"].shape
+                            torch_dtype = node.meta["tensor_meta"].dtype
+                        elif "val" in node.meta:
+                            torch_shape = node.meta["val"].shape
+                            torch_dtype = node.meta["val"].dtype
                         break
-            else:
-                # PARAMETER or BUFFER
+
+            elif spec.kind is torch.export.graph_signature.InputKind.PARAMETER:
+                # Handle PARAMETER type - must be in state_dict
+                if spec.target not in exported_program.state_dict:
+                    raise ValueError(f"Parameter {spec.target} not found in state_dict")
                 torch_shape = exported_program.state_dict[spec.target].shape
                 torch_dtype = exported_program.state_dict[spec.target].dtype
+            elif spec.kind is torch.export.graph_signature.InputKind.BUFFER:
+                # Handle BUFFER type - check state_dict first, then constants
+                if spec.target in exported_program.state_dict:
+                    torch_shape = exported_program.state_dict[spec.target].shape
+                    torch_dtype = exported_program.state_dict[spec.target].dtype
+                elif spec.target in exported_program.constants:
+                    # Non-persistent buffers are stored in constants, like inv_freq in llm
+                    # See https://github.com/huggingface/transformers/pull/24998
+                    const_tensor = exported_program.constants[spec.target]
+                    torch_shape = const_tensor.shape
+                    torch_dtype = const_tensor.dtype
+                else:
+                    # Buffer not found in either state_dict or constants, check if it's used
+                    is_used = False
+                    for node in exported_program.graph.find_nodes(
+                        op="placeholder", target=spec.target
+                    ):
+                        if len(node.users) > 0:
+                            is_used = True
+                            break
+
+                    if not is_used:
+                        print(f"Skipping unused buffer: {spec.target}")
+                        continue
+                    else:
+                        raise ValueError(
+                            f"Used buffer {spec.target} not found in state_dict or constants"
+                        )
+            else:
+                # Unknown InputKind type
+                raise ValueError(f"Unknown InputKind: {spec.kind} for {spec.target}")
 
             # TODO(mshr-h): Support range constraints
             relax_shape = [
-                torch_symbol_to_relax_var.setdefault(str(s), tvm.tir.SizeVar(str(s), "int64"))
-                if isinstance(s, torch.SymInt)
-                else s
+                (
+                    torch_symbol_to_relax_var.setdefault(str(s), tvm.tir.SizeVar(str(s), "int64"))
+                    if isinstance(s, torch.SymInt)
+                    else s
+                )
                 for s in torch_shape
             ]
             dtype = self._convert_data_type(torch_dtype)
@@ -694,6 +747,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         self.env[node] = getattr(exported_program.graph_module, node.target)
                     elif node.op == "call_function":
                         func_name = node.target.__name__
+                        print(f"convert: {func_name}")
                         self.env[node] = self.convert_map[func_name](node)
                     else:
                         raise ValueError(f"Unsupported op {node.op}")
