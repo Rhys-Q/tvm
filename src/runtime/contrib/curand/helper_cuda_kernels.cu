@@ -17,6 +17,7 @@
  * under the License.
  */
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 
 #include "./helper_cuda_kernels.h"
 
@@ -35,6 +36,89 @@ void ConvertFp32toFp16(const void* _src, void* _dst, int64_t num) {
   const float* src = static_cast<const float*>(_src);
   half* dst = static_cast<half*>(_dst);
   KernelFp32ToFp16<<<(num + 255) / 256, 256>>>(src, dst, num);
+}
+
+__global__ void KernelInitCurandStates(curandState* states, unsigned long seed, int64_t num) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx < num) {
+    curand_init(seed, idx, 0, &states[idx]);
+  }
+}
+
+void InitCurandStates(void* _states, unsigned long seed, int64_t num) {
+  curandState* states = static_cast<curandState*>(_states);
+  KernelInitCurandStates<<<(num + 255) / 256, 256>>>(states, seed, num);
+}
+
+template<typename T>
+__global__ void KernelGenerateRandInt(curandState* states, T* output, int64_t size,
+                                      T low, T high, int64_t num_states) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx < size) {
+    // Use round-robin assignment of states to threads
+    int state_idx = idx % num_states;
+    curandState localState = states[state_idx];
+
+    // Generate uniform random float and convert to integer range
+    float rand_val = curand_uniform(&localState);
+    T result = low + static_cast<T>(rand_val * (high - low));
+
+    // Ensure result is within bounds
+    if (result >= high) result = high - 1;
+    output[idx] = result;
+
+    // Update the state
+    states[state_idx] = localState;
+  }
+}
+
+void GenerateRandIntKernelImpl(void* _states, void* _output, int64_t size,
+                          int64_t low, int64_t high, DLDataType dtype) {
+  curandState* states = static_cast<curandState*>(_states);
+
+  // Calculate number of states (assume 65536 as default)
+  int64_t num_states = 65536;  // This should match CUDARandomEngine::max_states_
+
+  dim3 blocks((size + 255) / 256);
+  dim3 threads(256);
+
+  if (dtype.code == kDLInt && dtype.bits == 32) {
+    int32_t* output = static_cast<int32_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<int32_t>(low),
+                                               static_cast<int32_t>(high),
+                                               num_states);
+  } else if (dtype.code == kDLInt && dtype.bits == 16) {
+    int16_t* output = static_cast<int16_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<int16_t>(low),
+                                               static_cast<int16_t>(high),
+                                               num_states);
+  } else if (dtype.code == kDLInt && dtype.bits == 8) {
+    int8_t* output = static_cast<int8_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<int8_t>(low),
+                                               static_cast<int8_t>(high),
+                                               num_states);
+  } else if (dtype.code == kDLUInt && dtype.bits == 32) {
+    uint32_t* output = static_cast<uint32_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<uint32_t>(low),
+                                               static_cast<uint32_t>(high),
+                                               num_states);
+  } else if (dtype.code == kDLUInt && dtype.bits == 16) {
+    uint16_t* output = static_cast<uint16_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<uint16_t>(low),
+                                               static_cast<uint16_t>(high),
+                                               num_states);
+  } else if (dtype.code == kDLUInt && dtype.bits == 8) {
+    uint8_t* output = static_cast<uint8_t*>(_output);
+    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
+                                               static_cast<uint8_t>(low),
+                                               static_cast<uint8_t>(high),
+                                               num_states);
+  }
 }
 
 }  // namespace curand

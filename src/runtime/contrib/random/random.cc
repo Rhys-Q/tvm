@@ -101,6 +101,14 @@ TVM_FFI_STATIC_INIT_BLOCK({
                           unsigned rint = entry->random_engine.GetRandInt();
                           return low + rint % (high - low);
                         });
+                      } else if (out->device.device_type == kDLCUDA) {
+                        // Try to use CUDA Graph compatible randint implementation
+                        const auto cuda_randint = tvm::ffi::Function::GetGlobal("runtime.contrib.curand.RandInt");
+                        if (cuda_randint.has_value()) {
+                          (*cuda_randint)(low, high, out);
+                        } else {
+                          LOG(FATAL) << "CUDA randint not available. Please ensure cuRAND support is enabled.";
+                        }
                       } else {
                         LOG(FATAL) << "Do not support random.randint on this device yet";
                       }

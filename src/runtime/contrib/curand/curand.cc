@@ -17,6 +17,7 @@
  * under the License.
  */
 #include <curand.h>
+#include <dmlc/thread_local.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/base.h>
@@ -51,9 +52,62 @@ class CURandGenerator {
   curandGenerator_t gen;
 };
 
+/*!
+ * \brief CUDA Random Engine for CUDA Graph compatible random number generation
+ */
+class CUDARandomEngine {
+ public:
+  CUDARandomEngine() : initialized_(false), device_states_(nullptr), max_states_(0) {}
+
+  ~CUDARandomEngine() { Cleanup(); }
+
+  /*!
+   * \brief Initialize the CUDA random engine (called during model initialization)
+   * \param seed Random seed to use
+   */
+  void Init(unsigned long seed = 0);
+
+  /*!
+   * \brief Cleanup allocated resources
+   */
+  void Cleanup();
+
+  /*!
+   * \brief Check if the engine is initialized
+   * \return true if initialized, false otherwise
+   */
+  bool IsInitialized() const { return initialized_; }
+
+  /*!
+   * \brief Generate random integers using CUDA Graph compatible approach
+   * \param output Output tensor data pointer
+   * \param size Number of elements to generate
+   * \param low Lower bound (inclusive)
+   * \param high Upper bound (exclusive)
+   * \param dtype Data type of the output
+   */
+  void GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high, DLDataType dtype);
+
+ private:
+  bool initialized_;
+  void* device_states_;  // curandState array on device
+  int64_t max_states_;   // Maximum number of states allocated
+};
+
+struct CUDARandomThreadLocalEntry {
+  CUDARandomEngine cuda_random_engine;
+  static CUDARandomThreadLocalEntry* ThreadLocal();
+};
+
+typedef dmlc::ThreadLocalStore<CUDARandomThreadLocalEntry> CUDARandomThreadLocalStore;
+
+CUDARandomThreadLocalEntry* CUDARandomThreadLocalEntry::ThreadLocal() {
+  return CUDARandomThreadLocalStore::Get();
+}
+
 DeviceAPI* GetCUDADeviceAPI() {
-  const auto get_cuda_api = tvm::ffi::Function::GetGlobalRequired("device_api.cuda");
-  void* ret = get_cuda_api();
+  auto func = tvm::ffi::Function::GetGlobalRequired("device_api.cuda");
+  void* ret = func().cast<void*>();
   runtime::DeviceAPI* cuda_api = static_cast<runtime::DeviceAPI*>(ret);
   return cuda_api;
 }
@@ -74,6 +128,45 @@ struct DeferredFunc {
  private:
   std::function<void()> func_;
 };
+
+// Implementation of CUDARandomEngine methods
+void CUDARandomEngine::Init(unsigned long seed) {
+  if (initialized_) {
+    return;  // Already initialized
+  }
+
+  // Set up device states for CUDA Graph compatible random generation
+  max_states_ = 65536;  // Configurable number of states
+  size_t state_size = max_states_ * sizeof(curandState);
+
+  CUDA_CALL(cudaMalloc(&device_states_, state_size));
+
+  // Initialize curandState array (this is the only Host API call needed)
+  InitCurandStates(device_states_, seed, max_states_);
+
+  // Synchronize to ensure initialization is complete
+  CUDA_CALL(cudaDeviceSynchronize());
+
+  initialized_ = true;
+}
+
+void CUDARandomEngine::Cleanup() {
+  if (initialized_ && device_states_) {
+    CUDA_CALL(cudaFree(device_states_));
+    device_states_ = nullptr;
+  }
+  initialized_ = false;
+  max_states_ = 0;
+}
+
+void CUDARandomEngine::GenerateRandIntKernel(void* output, int64_t size,
+                                            int64_t low, int64_t high, DLDataType dtype) {
+  ICHECK(initialized_) << "CUDARandomEngine not initialized. Call Init() first.";
+  ICHECK(device_states_) << "Device states not allocated";
+
+  // Call the CUDA Graph compatible kernel
+  GenerateRandIntKernelImpl(device_states_, output, size, low, high, dtype);
+}
 
 void RandomFill(DLTensor* tensor) {
   static DeviceAPI* cuda_api = GetCUDADeviceAPI();
@@ -110,12 +203,32 @@ void RandomFill(DLTensor* tensor) {
   } else {
     LOG(FATAL) << "ValueError: Unsupported dtype: " << tensor->dtype;
   }
-  TVMSynchronize(tensor->device.device_type, tensor->device.device_type, nullptr);
+  // TVMSynchronize(tensor->device.device_type, tensor->device.device_type, nullptr);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK({
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("runtime.contrib.curand.RandomFill", RandomFill);
+  refl::GlobalDef()
+      .def("runtime.contrib.curand.RandomFill", RandomFill)
+      .def_packed("runtime.contrib.curand.Init",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
+                    unsigned long seed = args.size() > 0 ? args[0].cast<unsigned long>() : 0;
+                    entry->cuda_random_engine.Init(seed);
+                  })
+      .def_packed("runtime.contrib.curand.RandInt",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
+                    int64_t low = args[0].cast<int64_t>();
+                    int64_t high = args[1].cast<int64_t>();
+                    auto out = args[2].cast<DLTensor*>();
+
+                    ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
+                        << "CUDARandomEngine only works on CUDA devices";
+
+                    int64_t tensor_size = GetTensorSize(out);
+                    entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low, high, out->dtype);
+                  });
 });
 
 }  // namespace curand

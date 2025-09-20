@@ -20,7 +20,9 @@
 #define TVM_RUNTIME_CONTRIB_CURAND_HELPER_CUDA_KERNELS_H_
 
 #include <curand.h>
+#include <curand_kernel.h>
 #include <tvm/ffi/function.h>
+#include <tvm/runtime/data_type.h>
 
 namespace tvm {
 namespace runtime {
@@ -33,6 +35,26 @@ namespace curand {
  * \param num The number of elements in the array.
  */
 void ConvertFp32toFp16(const void* src, void* dst, int64_t num);
+
+/*!
+ * \brief Initialize curandState array for CUDA Graph compatible random generation
+ * \param states Array of curandState to initialize
+ * \param seed Random seed
+ * \param num Number of states to initialize
+ */
+void InitCurandStates(void* states, unsigned long seed, int64_t num);
+
+/*!
+ * \brief Generate random integers using curandState (CUDA Graph compatible)
+ * \param states Array of curandState
+ * \param output Output array
+ * \param size Number of elements to generate
+ * \param low Lower bound (inclusive)
+ * \param high Upper bound (exclusive)
+ * \param dtype Data type of output
+ */
+void GenerateRandIntKernelImpl(void* states, void* output, int64_t size,
+                          int64_t low, int64_t high, DLDataType dtype);
 
 }  // namespace curand
 }  // namespace runtime

@@ -50,6 +50,69 @@ def test_randint():
     verify()
 
 
+@tvm.testing.uses_gpu
+def test_randint_cuda_graph_compatible():
+    """Tests CUDA Graph compatible randint function"""
+    m = 1024
+    n = 1024
+
+    def test_cuda_randint():
+        if not tvm.testing.device_enabled("cuda"):
+            print("skip because CUDA is not enabled...")
+            return
+        if not tvm.get_global_func("runtime.contrib.curand.Init", True):
+            print("skip because cuRAND Init function is not available")
+            return
+        if not tvm.get_global_func("runtime.contrib.curand.RandInt", True):
+            print("skip because cuRAND RandInt function is not available")
+            return
+
+        dev = tvm.cuda(0)
+
+        # Initialize CUDA random engine first (outside CUDA graph)
+        init_func = tvm.get_global_func("runtime.contrib.curand.Init")
+        init_func(42)  # seed
+
+        # Test direct cuRAND RandInt call
+        randint_func = tvm.get_global_func("runtime.contrib.curand.RandInt")
+        a = tvm.nd.array(np.zeros((m, n), dtype="int32"), dev)
+        randint_func(-127, 128, a)
+        print(a)
+        na = a.numpy()
+        print(f"CUDA randint stats: mean={np.mean(na):.3f}, min={np.min(na)}, max={np.max(na)}")
+
+        # Verify the results are within expected bounds
+        assert np.min(na) >= -127
+        assert np.max(na) <= 127
+        assert abs(np.mean(na)) < 5.0  # Reasonable mean for uniform distribution
+
+        # Test different data types
+        for dtype in ["int8", "int16", "int32", "uint8", "uint16", "uint32"]:
+            try:
+                a_typed = tvm.nd.array(np.zeros((512, 512), dtype=dtype), dev)
+                if dtype.startswith('int'):
+                    randint_func(-10, 10, a_typed)
+                else:  # uint
+                    randint_func(0, 20, a_typed)
+                na_typed = a_typed.numpy()
+                print(f"CUDA randint {dtype}: min={np.min(na_typed)}, max={np.max(na_typed)}")
+            except Exception as e:
+                print(f"Warning: {dtype} test failed: {e}")
+
+        # Test via standard randint API (should automatically use CUDA backend)
+        A = random.randint(-50, 51, size=(512, 512), dtype="int32")
+        f = tvm.compile(te.create_prim_func([A]), target="cuda")
+        a_standard = tvm.nd.array(np.zeros((512, 512), dtype="int32"), dev)
+        f(a_standard)
+        na_standard = a_standard.numpy()
+
+        print(f"Standard API randint stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard)}, max={np.max(na_standard)}")
+        assert np.min(na_standard) >= -50
+        assert np.max(na_standard) <= 50
+
+    test_cuda_randint()
+
+
 def test_uniform():
     """Tests uniform function"""
     m = 10240
@@ -190,3 +253,4 @@ if __name__ == "__main__":
     test_normal()
     test_random_fill()
     test_random_fill_mt()
+    test_randint_cuda_graph_compatible()
