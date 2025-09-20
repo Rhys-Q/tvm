@@ -118,3 +118,144 @@ def test_tir_triton_integration():
         lib = tvm.compile(Module)
         output_nd = tvm.runtime.vm.VirtualMachine(lib, device)["main"](x_nd, y_nd)
         tvm.testing.assert_allclose(output_nd.numpy(), output_np, rtol=1e-5)
+
+
+@tvm.testing.requires_cuda
+def test_tir_triton_searchsorted_integration():
+    @triton.jit
+    def _searchsorted_kernel(A, V, OUT,
+                           N: tl.constexpr, iters: tl.constexpr,
+                           strideA_batch, strideA_last,
+                           strideV_batch, strideV_last,
+                           strideO_batch, strideO_last,
+                           right: tl.constexpr):
+        """Triton searchsorted kernel."""
+        batch_idx = tl.program_id(0)
+        val_idx = tl.program_id(1)
+
+        a_base = batch_idx * strideA_batch
+        v_ptr = batch_idx * strideV_batch + val_idx * strideV_last
+        out_ptr = batch_idx * strideO_batch + val_idx * strideO_last
+
+        v = tl.load(V + v_ptr)
+
+        lo = 0
+        hi = N
+
+        for _ in range(iters):
+            mid = (lo + hi) // 2
+            a_val = tl.load(A + a_base + mid * strideA_last,
+                           mask=mid < N,
+                           other=float("inf"))
+
+            cond = tl.where(right, a_val <= v, a_val < v)
+            lo = tl.where(cond, mid + 1, lo)
+            hi = tl.where(cond, hi, mid)
+
+        result = tl.minimum(tl.maximum(lo, 0), N)
+        tl.store(OUT + out_ptr, result)
+
+    @I.ir_module
+    class Module:
+        @T.prim_func
+        def searchsorted(
+            a_handle: T.handle, v_handle: T.handle, output_handle: T.handle
+        ) -> None:
+            T.func_attr({"global_symbol": "searchsorted"})
+            batch_size = T.int64()
+            n = T.int64()
+            m = T.int64()
+            a = T.match_buffer(a_handle, (batch_size, n), "float32")
+            v = T.match_buffer(v_handle, (batch_size, m), "float32")
+            output = T.match_buffer(output_handle, (batch_size, m), "int64")
+            with T.block("root"):
+                T.reads(a[0:batch_size, 0:n], v[0:batch_size, 0:m])
+                T.writes(output[0:batch_size, 0:m])
+                iters = T.meta_var(10)
+                T.call_kernel(
+                    _searchsorted_kernel,
+                    (batch_size, m),
+                    a.data,
+                    v.data,
+                    output.data,
+                    n,
+                    iters,
+                    n,
+                    1,
+                    m,
+                    1,
+                    m,
+                    1,
+                    False,
+                )
+
+        @R.function
+        def main(
+            a: R.Tensor(("batch_size", "n"), "float32"),
+            v: R.Tensor(("batch_size", "m"), "float32"),
+        ):
+            batch_size = T.int64()
+            n = T.int64()
+            m = T.int64()
+            with R.dataflow():
+                output = R.call_tir(
+                    Module.searchsorted,
+                    [a, v],
+                    relax.TensorStructInfo((batch_size, m), "int64"),
+                )
+                R.output(output)
+            return output
+
+    @I.ir_module
+    class Parsed:
+        @T.prim_func
+        def searchsorted(a_handle: T.handle, v_handle: T.handle, output_handle: T.handle):
+            batch_size = T.int64()
+            n = T.int64()
+            m = T.int64()
+            a = T.match_buffer(a_handle, (batch_size, n))
+            v = T.match_buffer(v_handle, (batch_size, m))
+            output = T.match_buffer(output_handle, (batch_size, m))
+            with T.block("root"):
+                T.reads(a[0:batch_size, 0:n], v[0:batch_size, 0:m])
+                T.writes(output[0:batch_size, 0:m])
+                T.call_packed(
+                    "_searchsorted_kernel",
+                    a.data,
+                    v.data,
+                    output.data,
+                    n,
+                    10,
+                    n,
+                    1,
+                    m,
+                    1,
+                    m,
+                    1,
+                    False,
+                    batch_size,
+                    m,
+                )
+
+    tvm.ir.assert_structural_equal(Module["searchsorted"], Parsed["searchsorted"])
+    assert len(Module.get_attr("external_mods")) == 1
+
+    device = tvm.cuda(0)
+    batch_size = 2
+    n = 10
+    m = 5
+
+    # Create sorted array for searchsorted
+    a_np = np.sort(np.random.rand(batch_size, n).astype(np.float32), axis=1)
+    v_np = np.random.rand(batch_size, m).astype(np.float32)
+
+    a_nd = tvm.nd.array(a_np, device)
+    v_nd = tvm.nd.array(v_np, device)
+
+    # Compute expected output using numpy searchsorted
+    expected_output = np.searchsorted(a_np, v_np, side='left')
+
+    with tvm.target.Target("cuda"):
+        lib = tvm.compile(Module)
+        output_nd = tvm.runtime.vm.VirtualMachine(lib, device)["main"](a_nd, v_nd)
+        np.testing.assert_array_equal(output_nd.numpy(), expected_output)
