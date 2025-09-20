@@ -56,6 +56,15 @@ void InitCurandStates(void* states, unsigned long seed, int64_t num);
 void GenerateRandIntKernelImpl(void* states, void* output, int64_t size,
                           int64_t low, int64_t high, DLDataType dtype);
 
+/*!
+ * \brief Generate uniform random floats [0,1) using curandState (CUDA Graph compatible)
+ * \param states Array of curandState
+ * \param output Output array
+ * \param size Number of elements to generate
+ * \param dtype Data type of output (float16, float32, float64)
+ */
+void GenerateUniformKernelImpl(void* states, void* output, int64_t size, DLDataType dtype);
+
 }  // namespace curand
 }  // namespace runtime
 }  // namespace tvm

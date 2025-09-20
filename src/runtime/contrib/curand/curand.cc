@@ -88,6 +88,14 @@ class CUDARandomEngine {
    */
   void GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high, DLDataType dtype);
 
+  /*!
+   * \brief Generate uniform random floats [0,1) using CUDA Graph compatible approach
+   * \param output Output tensor data pointer
+   * \param size Number of elements to generate
+   * \param dtype Data type of the output (float16, float32, float64)
+   */
+  void GenerateUniformKernel(void* output, int64_t size, DLDataType dtype);
+
  private:
   bool initialized_;
   void* device_states_;  // curandState array on device
@@ -168,6 +176,14 @@ void CUDARandomEngine::GenerateRandIntKernel(void* output, int64_t size,
   GenerateRandIntKernelImpl(device_states_, output, size, low, high, dtype);
 }
 
+void CUDARandomEngine::GenerateUniformKernel(void* output, int64_t size, DLDataType dtype) {
+  ICHECK(initialized_) << "CUDARandomEngine not initialized. Call Init() first.";
+  ICHECK(device_states_) << "Device states not allocated";
+
+  // Call the CUDA Graph compatible kernel
+  GenerateUniformKernelImpl(device_states_, output, size, dtype);
+}
+
 void RandomFill(DLTensor* tensor) {
   static DeviceAPI* cuda_api = GetCUDADeviceAPI();
   CHECK(tensor->device.device_type == DLDeviceType::kDLCUDA)
@@ -228,6 +244,19 @@ TVM_FFI_STATIC_INIT_BLOCK({
 
                     int64_t tensor_size = GetTensorSize(out);
                     entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low, high, out->dtype);
+                  })
+      .def_packed("runtime.contrib.curand.Uniform",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
+                    auto out = args[0].cast<DLTensor*>();
+
+                    ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
+                        << "CUDARandomEngine only works on CUDA devices";
+                    ICHECK(out->dtype.code == DLDataTypeCode::kDLFloat)
+                        << "Uniform random generation only supports float types";
+
+                    int64_t tensor_size = GetTensorSize(out);
+                    entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
                   });
 });
 

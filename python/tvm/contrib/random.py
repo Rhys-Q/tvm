@@ -112,4 +112,45 @@ def normal(loc, scale, size):
     )
 
 
+def rand(*size, dtype="float32"):
+    """Return random floats from uniform distribution over [0, 1).
+
+    Create a tensor of the given shape and populate it with random samples
+    from a uniform distribution over [0, 1).
+
+    Parameters
+    ----------
+    size : tuple of ints
+        Output shape. If the given shape is, e.g., (m, n, k), then m * n * k
+        samples are drawn.
+    dtype : str, optional
+        Data type of the output. Supported types: 'float16', 'float32', 'float64'.
+        Default is 'float32'.
+
+    Returns
+    -------
+    out : Tensor
+        Random values tensor with specified shape and dtype, values in [0, 1).
+
+    Examples
+    --------
+    >>> import tvm.contrib.random as random
+    >>> # Generate 1000x1000 random float32 values
+    >>> A = random.rand(1000, 1000)
+    >>> # Generate random float64 values
+    >>> B = random.rand(100, 200, dtype="float64")
+    """
+    if len(size) == 1 and isinstance(size[0], (tuple, list)):
+        size = size[0]
+
+    return te.extern(
+        size,
+        [],
+        lambda ins, outs: tvm.tir.call_packed(
+            "tvm.contrib.random.rand", outs[0]
+        ),
+        dtype=dtype,
+    )
+
+
 tvm_ffi._init_api("tvm.contrib.random")

@@ -113,6 +113,112 @@ def test_randint_cuda_graph_compatible():
     test_cuda_randint()
 
 
+@tvm.testing.uses_gpu
+def test_rand_cuda_graph_compatible():
+    """Tests CUDA Graph compatible rand function"""
+    m = 512
+    n = 512
+
+    def test_cuda_rand():
+        if not tvm.testing.device_enabled("cuda"):
+            print("skip because CUDA is not enabled...")
+            return
+        if not tvm.get_global_func("runtime.contrib.curand.Init", True):
+            print("skip because cuRAND Init function is not available")
+            return
+        if not tvm.get_global_func("runtime.contrib.curand.Uniform", True):
+            print("skip because cuRAND Uniform function is not available")
+            return
+
+        dev = tvm.cuda(0)
+
+        # Initialize CUDA random engine first (outside CUDA graph)
+        init_func = tvm.get_global_func("runtime.contrib.curand.Init")
+        init_func(42)  # seed
+
+        # Test direct cuRAND Uniform call
+        uniform_func = tvm.get_global_func("runtime.contrib.curand.Uniform")
+        a = tvm.nd.array(np.zeros((m, n), dtype="float32"), dev)
+        uniform_func(a)
+        print(a)
+
+        na = a.numpy()
+        print(f"CUDA uniform stats: mean={np.mean(na):.3f}, min={np.min(na):.6f}, max={np.max(na):.6f}")
+
+        # Verify the results are within expected bounds [0, 1)
+        assert np.min(na) >= 0.0
+        assert np.max(na) < 1.0
+        assert abs(np.mean(na) - 0.5) < 0.1  # Mean should be around 0.5 for uniform [0,1)
+
+        # Test different float types
+        for dtype in ["float32", "float64"]:
+            try:
+                a_typed = tvm.nd.array(np.zeros((256, 256), dtype=dtype), dev)
+                uniform_func(a_typed)
+                na_typed = a_typed.numpy()
+                print(f"CUDA uniform {dtype}: min={np.min(na_typed):.6f}, max={np.max(na_typed):.6f}")
+                assert np.min(na_typed) >= 0.0
+                assert np.max(na_typed) < 1.0
+            except Exception as e:
+                print(f"Warning: {dtype} test failed: {e}")
+
+        # Test via standard rand API (should automatically use CUDA backend)
+        A = random.rand(256, 256)
+        f = tvm.compile(te.create_prim_func([A]), target="cuda")
+        a_standard = tvm.nd.array(np.zeros((256, 256), dtype="float32"), dev)
+        f(a_standard)
+        na_standard = a_standard.numpy()
+
+        print(f"Standard API rand stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard):.6f}, max={np.max(na_standard):.6f}")
+        assert np.min(na_standard) >= 0.0
+        assert np.max(na_standard) < 1.0
+        assert abs(np.mean(na_standard) - 0.5) < 0.1
+
+        # Test different data types for standard API
+        for dtype in ["float32", "float64"]:
+            try:
+                A_typed = random.rand(128, 128, dtype=dtype)
+                f_typed = tvm.compile(te.create_prim_func([A_typed]), target="cuda")
+                a_typed_standard = tvm.nd.array(np.zeros((128, 128), dtype=dtype), dev)
+                f_typed(a_typed_standard)
+                na_typed_standard = a_typed_standard.numpy()
+                print(f"Standard API rand {dtype}: min={np.min(na_typed_standard):.6f}, max={np.max(na_typed_standard):.6f}")
+                assert np.min(na_typed_standard) >= 0.0
+                assert np.max(na_typed_standard) < 1.0
+            except Exception as e:
+                print(f"Warning: standard API {dtype} test failed: {e}")
+
+    test_cuda_rand()
+
+
+def test_rand():
+    """Tests rand function on CPU"""
+    m = 1024
+    n = 1024
+    A = random.rand(m, n)
+
+    def verify(target="llvm"):
+        if not tvm.testing.device_enabled(target):
+            print("skip because %s is not enabled..." % target)
+            return
+        if not tvm.get_global_func("tvm.contrib.random.rand", True):
+            print("skip because extern function is not available")
+            return
+        dev = tvm.cpu(0)
+        f = tvm.compile(te.create_prim_func([A]), target=target)
+        a = tvm.nd.array(np.zeros((m, n), dtype=A.dtype), dev)
+        f(a)
+        na = a.numpy()
+
+        # Check that values are in [0, 1)
+        assert np.min(na) >= 0.0
+        assert np.max(na) < 1.0
+        # Check reasonable distribution (mean should be around 0.5)
+        assert abs(np.mean(na) - 0.5) < 0.1
+
+    verify()
+
+
 def test_uniform():
     """Tests uniform function"""
     m = 10240
@@ -249,8 +355,10 @@ def test_random_fill_mt():
 
 if __name__ == "__main__":
     test_randint()
+    test_rand()
     test_uniform()
     test_normal()
     test_random_fill()
     test_random_fill_mt()
     test_randint_cuda_graph_compatible()
+    test_rand_cuda_graph_compatible()

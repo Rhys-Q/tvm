@@ -114,6 +114,46 @@ TVM_FFI_STATIC_INIT_BLOCK({
                       }
                     })
                   })
+      .def_packed("tvm.contrib.random.rand",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    RandomThreadLocalEntry* entry = RandomThreadLocalEntry::ThreadLocal();
+                    auto out = args[0].cast<DLTensor*>();
+                    ICHECK(out->strides == nullptr);
+                    ICHECK(out->dtype.code == kDLFloat) << "rand function only supports float types";
+
+                    DLDataType dtype = out->dtype;
+                    int64_t size = 1;
+                    for (int i = 0; i < out->ndim; ++i) {
+                      size *= out->shape[i];
+                    }
+
+                    if (out->device.device_type == kDLCPU) {
+                      // CPU implementation using uniform random generation
+                      if (dtype.bits == 32) {
+                        std::generate_n(static_cast<float*>(out->data), size, [&]() {
+                          unsigned rint = entry->random_engine.GetRandInt();
+                          return static_cast<float>(rint) / static_cast<float>(UINT32_MAX);
+                        });
+                      } else if (dtype.bits == 64) {
+                        std::generate_n(static_cast<double*>(out->data), size, [&]() {
+                          unsigned rint = entry->random_engine.GetRandInt();
+                          return static_cast<double>(rint) / static_cast<double>(UINT32_MAX);
+                        });
+                      } else {
+                        LOG(FATAL) << "Unsupported float precision: " << dtype.bits;
+                      }
+                    } else if (out->device.device_type == kDLCUDA) {
+                      // Try to use CUDA Graph compatible uniform implementation
+                      const auto cuda_uniform = tvm::ffi::Function::GetGlobal("runtime.contrib.curand.Uniform");
+                      if (cuda_uniform.has_value()) {
+                        (*cuda_uniform)(out);
+                      } else {
+                        LOG(FATAL) << "CUDA uniform not available. Please ensure cuRAND support is enabled.";
+                      }
+                    } else {
+                      LOG(FATAL) << "Do not support random.rand on this device yet";
+                    }
+                  })
       .def_packed("tvm.contrib.random.uniform",
                   [](ffi::PackedArgs args, ffi::Any* ret) {
                     RandomThreadLocalEntry* entry = RandomThreadLocalEntry::ThreadLocal();

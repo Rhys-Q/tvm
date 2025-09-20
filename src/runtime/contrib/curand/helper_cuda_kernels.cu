@@ -121,6 +121,44 @@ void GenerateRandIntKernelImpl(void* _states, void* _output, int64_t size,
   }
 }
 
+template<typename T>
+__global__ void KernelGenerateUniform(curandState* states, T* output, int64_t size, int64_t num_states) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx < size) {
+    // Use round-robin assignment of states to threads
+    int state_idx = idx % num_states;
+    curandState localState = states[state_idx];
+
+    // Generate uniform random float [0,1)
+    float rand_val = curand_uniform(&localState);
+    output[idx] = static_cast<T>(rand_val);
+
+    // Update the state
+    states[state_idx] = localState;
+  }
+}
+
+void GenerateUniformKernelImpl(void* _states, void* _output, int64_t size, DLDataType dtype) {
+  curandState* states = static_cast<curandState*>(_states);
+
+  // Calculate number of states (assume 65536 as default)
+  int64_t num_states = 65536;  // This should match CUDARandomEngine::max_states_
+
+  dim3 blocks((size + 255) / 256);
+  dim3 threads(256);
+
+  if (dtype.code == kDLFloat && dtype.bits == 32) {
+    float* output = static_cast<float*>(_output);
+    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+  } else if (dtype.code == kDLFloat && dtype.bits == 64) {
+    double* output = static_cast<double*>(_output);
+    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+  } else if (dtype.code == kDLFloat && dtype.bits == 16) {
+    half* output = static_cast<half*>(_output);
+    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+  }
+}
+
 }  // namespace curand
 }  // namespace runtime
 }  // namespace tvm
