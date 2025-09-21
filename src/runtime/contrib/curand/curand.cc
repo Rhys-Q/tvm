@@ -244,8 +244,8 @@ TVM_FFI_STATIC_INIT_BLOCK({
                         << "CUDARandomEngine only works on CUDA devices";
 
                     int64_t tensor_size = GetTensorSize(out);
-                    entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
-                                                                    high, out->dtype);
+                    // entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
+                    //                                                 high, out->dtype);
                   })
       .def_packed("runtime.contrib.curand.Uniform", [](ffi::PackedArgs args, ffi::Any* ret) {
         CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
@@ -257,7 +257,7 @@ TVM_FFI_STATIC_INIT_BLOCK({
             << "Uniform random generation only supports float types";
 
         int64_t tensor_size = GetTensorSize(out);
-        entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
+        // entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
       });
 });
 

@@ -67,8 +67,8 @@ class ApplyDefaultSchedule:  # pylint: disable=too-few-public-methods
         for g_var, func in mod.functions_items():
             if isinstance(func, tir.PrimFunc) and not _is_scheduled(func):
                 target = _get_target(func)
-                if g_var.name_hint == "less":
-                    breakpoint()
+                # if g_var.name_hint == "less":
+                #     breakpoint()
                 sch = _apply_rules(func, target, self.rules, tunable=False)
                 if sch is not None:
                     assert len(sch) == 1
