@@ -22,7 +22,7 @@ import abc
 from functools import reduce
 import math
 from typing import Callable, Dict, Optional, Tuple, Union, List
-
+import tvm
 from tvm import relax, tir
 
 
@@ -2094,13 +2094,14 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         dtype = self._convert_data_type(
             node.kwargs.get("dtype", torch.get_default_dtype()), self.env
         )
-        return self.block_builder.emit(
-            relax.op.full(
-                size,
-                relax.const(1, dtype),
-                dtype,
-            )
+        zeros_ = relax.op.zeros(shape=size, dtype=dtype)
+        out = relax.call_dps_packed(
+            "runtime.contrib.curand.Uniform",
+            [zeros_],
+            out_sinfo=[relax.TensorStructInfo(size, dtype)],
         )
+
+        return self.block_builder.emit(out)
 
     @abc.abstractmethod
     def create_convert_map(

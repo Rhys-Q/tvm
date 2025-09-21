@@ -27,6 +27,7 @@ from tvm.script import ir as I
 from tvm.script import relax as R
 from tvm.script import tir as T
 from tvm.contrib.triton_kernel.searchsorted import _searchsorted_kernel
+
 try:
     import triton
     import triton.language as tl
@@ -125,9 +126,7 @@ def test_tir_triton_searchsorted_integration():
     @I.ir_module
     class Module:
         @T.prim_func
-        def searchsorted(
-            a_handle: T.handle, v_handle: T.handle, output_handle: T.handle
-        ) -> None:
+        def searchsorted(a_handle: T.handle, v_handle: T.handle, output_handle: T.handle) -> None:
             T.func_attr({"global_symbol": "searchsorted"})
             batch_size = T.int64()
             n = T.int64()
@@ -188,13 +187,16 @@ def test_tir_triton_searchsorted_integration():
     v_nd = tvm.nd.array(v_np, device)
 
     # Compute expected output using numpy searchsorted
-    expected_output = torch.searchsorted(torch.from_numpy(a_np), torch.from_numpy(v_np), right=False)
+    expected_output = torch.searchsorted(
+        torch.from_numpy(a_np), torch.from_numpy(v_np), right=False
+    )
     expected_output = expected_output.numpy()
 
     with tvm.target.Target("cuda"):
         lib = tvm.compile(Module)
         output_nd = tvm.runtime.vm.VirtualMachine(lib, device)["main"](a_nd, v_nd)
         np.testing.assert_array_equal(output_nd.numpy(), expected_output)
+
 
 if __name__ == "__main__":
     test_tir_triton_searchsorted_integration()

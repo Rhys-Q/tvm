@@ -90,7 +90,7 @@ def test_randint_cuda_graph_compatible():
         for dtype in ["int8", "int16", "int32", "uint8", "uint16", "uint32"]:
             try:
                 a_typed = tvm.nd.array(np.zeros((512, 512), dtype=dtype), dev)
-                if dtype.startswith('int'):
+                if dtype.startswith("int"):
                     randint_func(-10, 10, a_typed)
                 else:  # uint
                     randint_func(0, 20, a_typed)
@@ -106,7 +106,9 @@ def test_randint_cuda_graph_compatible():
         f(a_standard)
         na_standard = a_standard.numpy()
 
-        print(f"Standard API randint stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard)}, max={np.max(na_standard)}")
+        print(
+            f"Standard API randint stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard)}, max={np.max(na_standard)}"
+        )
         assert np.min(na_standard) >= -50
         assert np.max(na_standard) <= 50
 
@@ -137,13 +139,16 @@ def test_rand_cuda_graph_compatible():
         init_func(42)  # seed
 
         # Test direct cuRAND Uniform call
+
         uniform_func = tvm.get_global_func("runtime.contrib.curand.Uniform")
         a = tvm.nd.array(np.zeros((m, n), dtype="float32"), dev)
         uniform_func(a)
         print(a)
 
         na = a.numpy()
-        print(f"CUDA uniform stats: mean={np.mean(na):.3f}, min={np.min(na):.6f}, max={np.max(na):.6f}")
+        print(
+            f"CUDA uniform stats: mean={np.mean(na):.3f}, min={np.min(na):.6f}, max={np.max(na):.6f}"
+        )
 
         # Verify the results are within expected bounds [0, 1)
         assert np.min(na) >= 0.0
@@ -156,7 +161,9 @@ def test_rand_cuda_graph_compatible():
                 a_typed = tvm.nd.array(np.zeros((256, 256), dtype=dtype), dev)
                 uniform_func(a_typed)
                 na_typed = a_typed.numpy()
-                print(f"CUDA uniform {dtype}: min={np.min(na_typed):.6f}, max={np.max(na_typed):.6f}")
+                print(
+                    f"CUDA uniform {dtype}: min={np.min(na_typed):.6f}, max={np.max(na_typed):.6f}"
+                )
                 assert np.min(na_typed) >= 0.0
                 assert np.max(na_typed) < 1.0
             except Exception as e:
@@ -169,7 +176,9 @@ def test_rand_cuda_graph_compatible():
         f(a_standard)
         na_standard = a_standard.numpy()
 
-        print(f"Standard API rand stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard):.6f}, max={np.max(na_standard):.6f}")
+        print(
+            f"Standard API rand stats: mean={np.mean(na_standard):.3f}, min={np.min(na_standard):.6f}, max={np.max(na_standard):.6f}"
+        )
         assert np.min(na_standard) >= 0.0
         assert np.max(na_standard) < 1.0
         assert abs(np.mean(na_standard) - 0.5) < 0.1
@@ -182,7 +191,9 @@ def test_rand_cuda_graph_compatible():
                 a_typed_standard = tvm.nd.array(np.zeros((128, 128), dtype=dtype), dev)
                 f_typed(a_typed_standard)
                 na_typed_standard = a_typed_standard.numpy()
-                print(f"Standard API rand {dtype}: min={np.min(na_typed_standard):.6f}, max={np.max(na_typed_standard):.6f}")
+                print(
+                    f"Standard API rand {dtype}: min={np.min(na_typed_standard):.6f}, max={np.max(na_typed_standard):.6f}"
+                )
                 assert np.min(na_typed_standard) >= 0.0
                 assert np.max(na_typed_standard) < 1.0
             except Exception as e:
