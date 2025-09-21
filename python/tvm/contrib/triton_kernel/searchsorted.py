@@ -89,7 +89,7 @@ def _searchsorted_kernel_old(A, V, OUT,
 
 @triton.jit
 def _searchsorted_kernel(A, V, OUT,
-                         N: tl.constexpr, iters: tl.constexpr,
+                         N, 
                          strideA_batch, strideA_last,
                          strideV_batch, strideV_last,
                          strideO_batch, strideO_last,
@@ -109,7 +109,9 @@ def _searchsorted_kernel(A, V, OUT,
     # init search range
     lo = 0
     hi = N
-
+    # iters = T.ceil(T.log2(n)) + 1
+    iters = tl.ceil(tl.log2(tl.cast(N, tl.float32)))+1
+    iters = tl.cast(iters, tl.int32)
     for _ in range(iters):
         mid = (lo + hi) // 2
         # safe load, NaN -> +inf
@@ -215,12 +217,11 @@ def triton_searchsorted(A: torch.Tensor, V: torch.Tensor, *, side: str = None, r
     strideO_last = 1
 
     # Launch kernel with proper grid size
-    iters = math.ceil(math.log2(N)) + 1 if N > 1 else 1
     if B > 0 and M > 0:
         grid = (B, M)
         nvtx.range_push("triton_inference")
         _searchsorted_kernel[grid](
-            A_2d, V_2d, OUT, N,iters,
+            A_2d, V_2d, OUT, N,
             strideA_batch, strideA_last,
             strideV_batch, strideV_last,
             strideO_batch, strideO_last,

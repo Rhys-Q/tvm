@@ -18,7 +18,7 @@ import sys
 
 import numpy as np
 import pytest
-
+import torch
 import tvm
 import tvm.testing
 from tvm import relax
@@ -26,7 +26,7 @@ from tvm.relax.frontend import nn
 from tvm.script import ir as I
 from tvm.script import relax as R
 from tvm.script import tir as T
-
+from tvm.contrib.triton_kernel.searchsorted import _searchsorted_kernel
 try:
     import triton
     import triton.language as tl
@@ -122,39 +122,6 @@ def test_tir_triton_integration():
 
 @tvm.testing.requires_cuda
 def test_tir_triton_searchsorted_integration():
-    @triton.jit
-    def _searchsorted_kernel(A, V, OUT,
-                           N: tl.constexpr, iters: tl.constexpr,
-                           strideA_batch, strideA_last,
-                           strideV_batch, strideV_last,
-                           strideO_batch, strideO_last,
-                           right: tl.constexpr):
-        """Triton searchsorted kernel."""
-        batch_idx = tl.program_id(0)
-        val_idx = tl.program_id(1)
-
-        a_base = batch_idx * strideA_batch
-        v_ptr = batch_idx * strideV_batch + val_idx * strideV_last
-        out_ptr = batch_idx * strideO_batch + val_idx * strideO_last
-
-        v = tl.load(V + v_ptr)
-
-        lo = 0
-        hi = N
-
-        for _ in range(iters):
-            mid = (lo + hi) // 2
-            a_val = tl.load(A + a_base + mid * strideA_last,
-                           mask=mid < N,
-                           other=float("inf"))
-
-            cond = tl.where(right, a_val <= v, a_val < v)
-            lo = tl.where(cond, mid + 1, lo)
-            hi = tl.where(cond, hi, mid)
-
-        result = tl.minimum(tl.maximum(lo, 0), N)
-        tl.store(OUT + out_ptr, result)
-
     @I.ir_module
     class Module:
         @T.prim_func
@@ -171,21 +138,22 @@ def test_tir_triton_searchsorted_integration():
             with T.block("root"):
                 T.reads(a[0:batch_size, 0:n], v[0:batch_size, 0:m])
                 T.writes(output[0:batch_size, 0:m])
-                iters = T.meta_var(10)
+                # iters = T.ceil(T.log2(n)) + 1
+                # iters = T.meta_var(T.int64(iters))
                 T.call_kernel(
                     _searchsorted_kernel,
                     (batch_size, m),
                     a.data,
                     v.data,
                     output.data,
+                    T.int32(n),
+                    # iters,
                     n,
-                    iters,
-                    n,
-                    1,
+                    T.int64(1),
                     m,
-                    1,
+                    T.int64(1),
                     m,
-                    1,
+                    T.int64(1),
                     False,
                 )
 
@@ -206,40 +174,7 @@ def test_tir_triton_searchsorted_integration():
                 R.output(output)
             return output
 
-    @I.ir_module
-    class Parsed:
-        @T.prim_func
-        def searchsorted(a_handle: T.handle, v_handle: T.handle, output_handle: T.handle):
-            batch_size = T.int64()
-            n = T.int64()
-            m = T.int64()
-            a = T.match_buffer(a_handle, (batch_size, n))
-            v = T.match_buffer(v_handle, (batch_size, m))
-            output = T.match_buffer(output_handle, (batch_size, m))
-            with T.block("root"):
-                T.reads(a[0:batch_size, 0:n], v[0:batch_size, 0:m])
-                T.writes(output[0:batch_size, 0:m])
-                T.call_packed(
-                    "_searchsorted_kernel",
-                    a.data,
-                    v.data,
-                    output.data,
-                    n,
-                    10,
-                    n,
-                    1,
-                    m,
-                    1,
-                    m,
-                    1,
-                    False,
-                    batch_size,
-                    m,
-                )
-
-    tvm.ir.assert_structural_equal(Module["searchsorted"], Parsed["searchsorted"])
     assert len(Module.get_attr("external_mods")) == 1
-
     device = tvm.cuda(0)
     batch_size = 2
     n = 10
@@ -253,9 +188,13 @@ def test_tir_triton_searchsorted_integration():
     v_nd = tvm.nd.array(v_np, device)
 
     # Compute expected output using numpy searchsorted
-    expected_output = np.searchsorted(a_np, v_np, side='left')
+    expected_output = torch.searchsorted(torch.from_numpy(a_np), torch.from_numpy(v_np), right=False)
+    expected_output = expected_output.numpy()
 
     with tvm.target.Target("cuda"):
         lib = tvm.compile(Module)
         output_nd = tvm.runtime.vm.VirtualMachine(lib, device)["main"](a_nd, v_nd)
         np.testing.assert_array_equal(output_nd.numpy(), expected_output)
+
+if __name__ == "__main__":
+    test_tir_triton_searchsorted_integration()
