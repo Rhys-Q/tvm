@@ -26,6 +26,59 @@ import tvm
 from tvm import relax, tir
 
 
+def get_promoted_dtype(dtype1: str, dtype2: str) -> str:
+    """
+    Determine the promoted dtype for binary operations following PyTorch promotion rules.
+    Priority: bool < int8 < int16 < int32 < int64 < float16 < float32 < float64
+    """
+    dtype_precedence = {
+        "bool": 0,
+        "int8": 1,
+        "int16": 2,
+        "int32": 3,
+        "int64": 4,
+        "float16": 5,
+        "float32": 6,
+        "float64": 7,
+    }
+
+    # Get precedence values, default to highest for unknown types
+    prec1 = dtype_precedence.get(dtype1, 7)
+    prec2 = dtype_precedence.get(dtype2, 7)
+
+    # Return the dtype with higher precedence
+    if prec1 >= prec2:
+        return dtype1
+    else:
+        return dtype2
+
+
+def promote_binary_op_args(block_builder, lhs, rhs):
+    if isinstance(lhs, relax.Expr) and isinstance(rhs, relax.Expr):
+        # Both are expressions, check if type promotion is needed
+        lhs_dtype = lhs.struct_info.dtype
+        rhs_dtype = rhs.struct_info.dtype
+
+        if lhs_dtype != rhs_dtype:
+            promoted_dtype = get_promoted_dtype(lhs_dtype, rhs_dtype)
+
+            # Cast to promoted type if needed
+            if lhs_dtype != promoted_dtype:
+                lhs = block_builder.emit(relax.op.astype(lhs, promoted_dtype))
+            if rhs_dtype != promoted_dtype:
+                rhs = block_builder.emit(relax.op.astype(rhs, promoted_dtype))
+
+        return lhs, rhs
+    elif isinstance(lhs, relax.Expr):
+        assert isinstance(lhs.struct_info, relax.TensorStructInfo)
+        return lhs, relax.const(rhs, lhs.struct_info.dtype)
+    elif isinstance(rhs, relax.Expr):
+        assert isinstance(rhs.struct_info, relax.TensorStructInfo)
+        return relax.const(lhs, rhs.struct_info.dtype), rhs
+    else:
+        assert False
+
+
 class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     """Base class for FX Graph Importer."""
 
@@ -388,23 +441,13 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         from torch import fx
 
         def convert(node: fx.Node) -> relax.Var:
-            def promote_binary_op_args(lhs, rhs):
-                if isinstance(lhs, relax.Expr) and isinstance(rhs, relax.Expr):
-                    return lhs, rhs
-                elif isinstance(lhs, relax.Expr):
-                    assert isinstance(lhs.struct_info, relax.TensorStructInfo)
-                    return lhs, relax.const(rhs, lhs.struct_info.dtype)
-                elif isinstance(rhs, relax.Expr):
-                    assert isinstance(rhs.struct_info, relax.TensorStructInfo)
-                    return relax.const(lhs, rhs.struct_info.dtype), rhs
-                else:
-                    assert False
 
             def call_binary_op(op, lhs, rhs):
-                lhs, rhs = promote_binary_op_args(lhs, rhs)
+                lhs, rhs = promote_binary_op_args(self.block_builder, lhs, rhs)
                 return self.block_builder.emit(op(lhs, rhs))
 
             lhs, rhs = self.retrieve_args(node)
+            print(f"binary op: lhs, rhs: {lhs}, {rhs}")
             if isinstance(lhs, relax.Var) or isinstance(rhs, relax.Var):
                 return call_binary_op(relax_op, lhs, rhs)
             elif isinstance(lhs, relax.expr.Constant):
@@ -459,6 +502,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         args = self.retrieve_args(node)
         lhs = args[0]
         rhs = args[1]
+
+        lhs, rhs = promote_binary_op_args(self.block_builder, lhs, rhs)
 
         if isinstance(rhs, (int, float)):
             rhs = relax.const(rhs)
@@ -1348,7 +1393,15 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         keepdim = node.kwargs["keepdim"] if "keepdim" in node.kwargs else False
         if len(args) == 1:
             return self.block_builder.emit(relax.op.sum(args[0], keepdims=keepdim))
-        return self.block_builder.emit(relax.op.sum(args[0], args[1]))
+        elif len(args) == 2:
+            if isinstance(args[1], bool):
+                return self.block_builder.emit(relax.op.sum(args[0], keepdims=args[1]))
+            else:
+                return self.block_builder.emit(relax.op.sum(args[0], args[1], keepdims=keepdim))
+        elif len(args) == 3:
+            return self.block_builder.emit(relax.op.sum(args[0], args[1], keepdims=args[2]))
+        else:
+            raise NotImplementedError()
 
     def _var(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
@@ -1700,6 +1753,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _squeeze(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
+        if x.struct_info.shape[dim] != 1:
+            return x
         return self.block_builder.emit(relax.op.squeeze(x, dim))
 
     def _stack(self, node: fx.Node) -> relax.Var:
@@ -1718,7 +1773,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         x = self.env[node.args[0]]
         indices = self.env[node.args[1]]
         indices = self.block_builder.emit(relax.op.astype(indices, "int32"))
-        return self.block_builder.emit(relax.op.take(x, indices))
+        indices_shape = [d.value for d in indices.struct_info.shape]
+        if math.prod(indices_shape) == 1 and len(indices_shape) != 1:
+            indices = self.block_builder.emit(relax.op.reshape(indices, [1]))
+        axis = node.args[2]
+        return self.block_builder.emit(relax.op.take(x, indices, axis=axis))
 
     def _tile(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
@@ -1814,7 +1873,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         elif any([isinstance(x, float) for x in start_end_step]):
             dtype = self._convert_data_type(torch.get_default_dtype())
         else:
-            dtype = "int64"
+            dtype = "int32"
         start_end_step = [
             self.env[x] if isinstance(x, torch.fx.Node) else x for x in start_end_step
         ]
@@ -2101,6 +2160,32 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             out_sinfo=[relax.TensorStructInfo(size, dtype)],
         )
 
+        return self.block_builder.emit(out)
+
+    def _randint(self, node: fx.Node) -> relax.Var:
+        import torch
+
+        args = self.retrieve_args(node)
+        low = args[0]
+        high = args[1]
+        size = relax.ShapeExpr(args[2] if isinstance(args[2], (list, tuple)) else (args[2],))
+        dtype = "int32"
+        zeros_ = relax.op.zeros(shape=size, dtype=dtype)
+        out = relax.call_dps_packed(
+            "runtime.contrib.curand.RandInt",
+            [low, high, zeros_],
+            out_sinfo=[relax.TensorStructInfo(size, dtype)],
+        )
+
+        return self.block_builder.emit(out)
+
+    def _searchsorted(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        out = relax.call_dps_packed(
+            "tvm.triton.search_sorted",
+            (args[0], args[1]),
+            out_sinfo=relax.TensorStructInfo(shape=args[1].struct_info.shape, dtype="int32"),
+        )
         return self.block_builder.emit(out)
 
     @abc.abstractmethod

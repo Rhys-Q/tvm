@@ -86,7 +86,8 @@ class CUDARandomEngine {
    * \param high Upper bound (exclusive)
    * \param dtype Data type of the output
    */
-  void GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high, DLDataType dtype);
+  void GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high,
+                             DLDataType dtype);
 
   /*!
    * \brief Generate uniform random floats [0,1) using CUDA Graph compatible approach
@@ -139,9 +140,9 @@ struct DeferredFunc {
 
 // Implementation of CUDARandomEngine methods
 void CUDARandomEngine::Init(unsigned long seed) {
-  if (initialized_) {
-    return;  // Already initialized
-  }
+  // if (initialized_) {
+  //   return;  // Already initialized
+  // }
 
   // Set up device states for CUDA Graph compatible random generation
   max_states_ = 65536;  // Configurable number of states
@@ -167,8 +168,8 @@ void CUDARandomEngine::Cleanup() {
   max_states_ = 0;
 }
 
-void CUDARandomEngine::GenerateRandIntKernel(void* output, int64_t size,
-                                            int64_t low, int64_t high, DLDataType dtype) {
+void CUDARandomEngine::GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high,
+                                             DLDataType dtype) {
   ICHECK(initialized_) << "CUDARandomEngine not initialized. Call Init() first.";
   ICHECK(device_states_) << "Device states not allocated";
 
@@ -243,21 +244,21 @@ TVM_FFI_STATIC_INIT_BLOCK({
                         << "CUDARandomEngine only works on CUDA devices";
 
                     int64_t tensor_size = GetTensorSize(out);
-                    entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low, high, out->dtype);
+                    entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
+                                                                    high, out->dtype);
                   })
-      .def_packed("runtime.contrib.curand.Uniform",
-                  [](ffi::PackedArgs args, ffi::Any* ret) {
-                    CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
-                    auto out = args[0].cast<DLTensor*>();
+      .def_packed("runtime.contrib.curand.Uniform", [](ffi::PackedArgs args, ffi::Any* ret) {
+        CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
+        auto out = args[0].cast<DLTensor*>();
 
-                    ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
-                        << "CUDARandomEngine only works on CUDA devices";
-                    ICHECK(out->dtype.code == DLDataTypeCode::kDLFloat)
-                        << "Uniform random generation only supports float types";
+        ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
+            << "CUDARandomEngine only works on CUDA devices";
+        ICHECK(out->dtype.code == DLDataTypeCode::kDLFloat)
+            << "Uniform random generation only supports float types";
 
-                    int64_t tensor_size = GetTensorSize(out);
-                    entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
-                  });
+        int64_t tensor_size = GetTensorSize(out);
+        entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
+      });
 });
 
 }  // namespace curand

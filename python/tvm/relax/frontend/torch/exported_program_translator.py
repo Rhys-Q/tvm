@@ -514,7 +514,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "argmin.default": self._argmax_argmin(relax.op.argmin),
             "where.self": self._where,
             "bucketize.Tensor": self._bucketize,
-            "searchsorted.Tensor": self._bucketize,
+            "searchsorted.Tensor": self._searchsorted,
             # tensor manipulation
             "argsort.default": self._argsort,
             "broadcast_to.default": self._broadcast_to,
@@ -598,7 +598,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "zeros_like.default": self._zeros_like,
             # random
             "rand.default": self._rand,
-            "randint.low": self._rand,
+            "randint.low": self._randint,
             # datatype
             "to.dtype": self._to,
             "to.dtype_layout": self._to,
@@ -749,6 +749,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         func_name = node.target.__name__
                         print(f"convert: {func_name}")
                         self.env[node] = self.convert_map[func_name](node)
+                        print(f"get: {self.env[node]}")
                     else:
                         raise ValueError(f"Unsupported op {node.op}")
             assert output is not None

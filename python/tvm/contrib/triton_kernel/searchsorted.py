@@ -7,6 +7,10 @@ import triton.language as tl
 import torch
 import math
 import torch.cuda.nvtx as nvtx
+from typing import List, Literal, Tuple
+import tvm
+from tvm.script import tir as T
+from tvm.script import ir as I
 
 
 @triton.jit
@@ -143,6 +147,53 @@ def _searchsorted_kernel(
 
     result = tl.minimum(tl.maximum(lo, 0), N)
     tl.store(OUT + out_ptr, result)
+
+
+def get_tir_searchsorted(batch, m, n, in_dtype, out_dtype, extern_mods: List[tvm.runtime.Module]):
+    name_suffix = f"_batch{batch}_M{m}_N{n}__in{in_dtype}_out{out_dtype}"
+    kernel_name = f"triton_searchsorted{name_suffix}"
+    tir_name = f"tir_searchsorted{name_suffix}"
+    for ext_mod in extern_mods:
+        if ext_mod.implements_function(kernel_name):
+            return [None, tir_name]
+    triton_kernel = _searchsorted_kernel
+    triton_kernel.__name__ = kernel_name
+
+    @I.ir_module
+    class Module:
+        @T.prim_func
+        def searchsorted(a_handle: T.handle, v_handle: T.handle, output_handle: T.handle) -> None:
+            T.func_attr({"op_pattern": 8, "tir.is_scheduled": 1})
+            batch_size = T.int64()
+            n = T.int64()
+            m = T.int64()
+            a = T.match_buffer(a_handle, (batch_size, n), "float32")
+            v = T.match_buffer(v_handle, (batch_size, m), "float32")
+            output = T.match_buffer(output_handle, (batch_size, m), "int32")
+            with T.block("root"):
+                T.reads(a[0:batch_size, 0:n], v[0:batch_size, 0:m])
+                T.writes(output[0:batch_size, 0:m])
+                T.call_kernel(
+                    _searchsorted_kernel,
+                    (batch_size, m),
+                    a.data,
+                    v.data,
+                    output.data,
+                    T.int32(n),
+                    # iters,
+                    n,
+                    T.int64(1),
+                    m,
+                    T.int64(1),
+                    m,
+                    T.int64(1),
+                    False,
+                )
+
+    new_ext_mods = Module.attrs["external_mods"]  # type: ignore  # pylint: disable=no-member
+    assert len(new_ext_mods) == 1
+    extern_mods.append(new_ext_mods[0])
+    return Module["searchsorted"], tir_name  # type: ignore
 
 
 def triton_searchsorted(

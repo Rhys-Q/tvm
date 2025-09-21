@@ -680,7 +680,12 @@ class FusedTIRConstructor : public ExprVisitor {
       }
     }
     // Update fused func name
-    func_info_.global_name += "_" + gv->name_hint;
+    String name_hint = gv->name_hint;
+    if (name_hint.empty()) {
+      // Generate a unique name if name_hint is empty
+      name_hint = "func_" + std::to_string(func_info_.bodies.size());
+    }
+    func_info_.global_name += "_" + name_hint;
   }
 
   void VisitExpr_(const TupleGetItemNode* tuple_get_item) final {
@@ -958,6 +963,11 @@ class FusedTIRConstructor : public ExprVisitor {
     Map<String, Any> attr_map;
     attr_map.Set(tir::attr::kNoAlias, true);
     tir::FuseTIRBufferSubstitutor subst(func_info_.buffer_subst_map, func_info_.symbolic_var_remap);
+
+    // Ensure the function name is not exactly "fused"
+    if (func_info_.global_name == "fused") {
+      func_info_.global_name += "_main";
+    }
     ICHECK(func_info_.global_name != "fused");
     // Remove output buffers from func_info_.alloc_buffers
     Array<tir::Buffer> alloc_buffers;

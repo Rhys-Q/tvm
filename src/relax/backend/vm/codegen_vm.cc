@@ -112,7 +112,7 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
         Expr expr = GetBoundValue(binding);
 
         Instruction::Arg value = VisitExpr(expr);
-        if (expr.as<VarNode>()) {
+        if (expr.as<VarNode>() || expr.as<DataflowVarNode>()) {
           // For a normalized relax module, there should be one
           // register for each relax::Binding.  This makes the Relax
           // semantics of R.vm.kill_* operate the same as the Python
@@ -210,6 +210,14 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
     Var var = GetRef<Var>(op);
     auto it = this->var_arg_map_.find(var);
     ICHECK(it != this->var_arg_map_.end()) << "Var " << var << " is not defined";
+    return it->second;
+  }
+
+  Instruction::Arg VisitExpr_(const DataflowVarNode* op) final {
+    // DataflowVar is a subclass of Var, so we can treat it the same way
+    Var var = GetRef<Var>(op);
+    auto it = this->var_arg_map_.find(var);
+    ICHECK(it != this->var_arg_map_.end()) << "DataflowVar " << var << " is not defined";
     return it->second;
   }
 

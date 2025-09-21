@@ -365,7 +365,11 @@ StructInfo InferStructInfoArange(const Call& call, const BlockBuilder& ctx) {
   DataType dtype = call->attrs.as<InitAttrs>()->dtype;
   PrimExpr num_elem;
   if (start.dtype().is_int() && end.dtype().is_int() && step.dtype().is_int()) {
-    num_elem = tvm::floordiv((end - start + step - 1), step);
+    // For positive step: ceil((end - start) / step) = (end - start + step - 1) / step
+    // For negative step: ceil((end - start) / step) = (end - start + step + 1) / step
+    PrimExpr diff = end - start;
+    PrimExpr step_sign_adj = tvm::if_then_else(step > 0, step - 1, step + 1);
+    num_elem = tvm::floordiv(diff + step_sign_adj, step);
   } else {
     num_elem = tvm::cast(tvm::DataType::Int(64),
                          tvm::ceil(tvm::cast(tvm::DataType::Float(32), end - start) / step));
