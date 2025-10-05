@@ -747,9 +747,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         self.env[node] = getattr(exported_program.graph_module, node.target)
                     elif node.op == "call_function":
                         func_name = node.target.__name__
-                        print(f"convert: {func_name}")
                         self.env[node] = self.convert_map[func_name](node)
-                        print(f"get: {self.env[node]}")
                     else:
                         raise ValueError(f"Unsupported op {node.op}")
             assert output is not None

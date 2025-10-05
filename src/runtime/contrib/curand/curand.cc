@@ -18,6 +18,7 @@
  */
 #include <curand.h>
 #include <dmlc/thread_local.h>
+#include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/base.h>
@@ -87,7 +88,7 @@ class CUDARandomEngine {
    * \param dtype Data type of the output
    */
   void GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high,
-                             DLDataType dtype);
+                             DLDataType dtype, cudaStream_t stream);
 
   /*!
    * \brief Generate uniform random floats [0,1) using CUDA Graph compatible approach
@@ -95,7 +96,7 @@ class CUDARandomEngine {
    * \param size Number of elements to generate
    * \param dtype Data type of the output (float16, float32, float64)
    */
-  void GenerateUniformKernel(void* output, int64_t size, DLDataType dtype);
+  void GenerateUniformKernel(void* output, int64_t size, DLDataType dtype, cudaStream_t stream);
 
  private:
   bool initialized_;
@@ -169,20 +170,21 @@ void CUDARandomEngine::Cleanup() {
 }
 
 void CUDARandomEngine::GenerateRandIntKernel(void* output, int64_t size, int64_t low, int64_t high,
-                                             DLDataType dtype) {
+                                             DLDataType dtype, cudaStream_t stream) {
   ICHECK(initialized_) << "CUDARandomEngine not initialized. Call Init() first.";
   ICHECK(device_states_) << "Device states not allocated";
 
   // Call the CUDA Graph compatible kernel
-  GenerateRandIntKernelImpl(device_states_, output, size, low, high, dtype);
+  GenerateRandIntKernelImpl(device_states_, output, size, low, high, dtype, stream);
 }
 
-void CUDARandomEngine::GenerateUniformKernel(void* output, int64_t size, DLDataType dtype) {
+void CUDARandomEngine::GenerateUniformKernel(void* output, int64_t size, DLDataType dtype,
+                                             cudaStream_t stream) {
   ICHECK(initialized_) << "CUDARandomEngine not initialized. Call Init() first.";
   ICHECK(device_states_) << "Device states not allocated";
 
   // Call the CUDA Graph compatible kernel
-  GenerateUniformKernelImpl(device_states_, output, size, dtype);
+  GenerateUniformKernelImpl(device_states_, output, size, dtype, stream);
 }
 
 void RandomFill(DLTensor* tensor) {
@@ -244,8 +246,10 @@ TVM_FFI_STATIC_INIT_BLOCK({
                         << "CUDARandomEngine only works on CUDA devices";
 
                     int64_t tensor_size = GetTensorSize(out);
-                    // entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
-                    //                                                 high, out->dtype);
+                    cudaStream_t stream = static_cast<cudaStream_t>(
+                        TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
+                    entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
+                                                                    high, out->dtype, stream);
                   })
       .def_packed("runtime.contrib.curand.Uniform", [](ffi::PackedArgs args, ffi::Any* ret) {
         CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
@@ -257,7 +261,9 @@ TVM_FFI_STATIC_INIT_BLOCK({
             << "Uniform random generation only supports float types";
 
         int64_t tensor_size = GetTensorSize(out);
-        // entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype);
+        cudaStream_t stream =
+            static_cast<cudaStream_t>(TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
+        entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype, stream);
       });
 });
 

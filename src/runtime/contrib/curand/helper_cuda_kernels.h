@@ -53,8 +53,8 @@ void InitCurandStates(void* states, unsigned long seed, int64_t num);
  * \param high Upper bound (exclusive)
  * \param dtype Data type of output
  */
-void GenerateRandIntKernelImpl(void* states, void* output, int64_t size,
-                          int64_t low, int64_t high, DLDataType dtype);
+void GenerateRandIntKernelImpl(void* states, void* output, int64_t size, int64_t low, int64_t high,
+                               DLDataType dtype, cudaStream_t stream);
 
 /*!
  * \brief Generate uniform random floats [0,1) using curandState (CUDA Graph compatible)
@@ -63,7 +63,8 @@ void GenerateRandIntKernelImpl(void* states, void* output, int64_t size,
  * \param size Number of elements to generate
  * \param dtype Data type of output (float16, float32, float64)
  */
-void GenerateUniformKernelImpl(void* states, void* output, int64_t size, DLDataType dtype);
+void GenerateUniformKernelImpl(void* states, void* output, int64_t size, DLDataType dtype,
+                               cudaStream_t stream);
 
 }  // namespace curand
 }  // namespace runtime

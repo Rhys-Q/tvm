@@ -50,9 +50,9 @@ void InitCurandStates(void* _states, unsigned long seed, int64_t num) {
   KernelInitCurandStates<<<(num + 255) / 256, 256>>>(states, seed, num);
 }
 
-template<typename T>
-__global__ void KernelGenerateRandInt(curandState* states, T* output, int64_t size,
-                                      T low, T high, int64_t num_states) {
+template <typename T>
+__global__ void KernelGenerateRandInt(curandState* states, T* output, int64_t size, T low, T high,
+                                      int64_t num_states) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
   if (idx < size) {
     // Use round-robin assignment of states to threads
@@ -72,8 +72,8 @@ __global__ void KernelGenerateRandInt(curandState* states, T* output, int64_t si
   }
 }
 
-void GenerateRandIntKernelImpl(void* _states, void* _output, int64_t size,
-                          int64_t low, int64_t high, DLDataType dtype) {
+void GenerateRandIntKernelImpl(void* _states, void* _output, int64_t size, int64_t low,
+                               int64_t high, DLDataType dtype, cudaStream_t stream) {
   curandState* states = static_cast<curandState*>(_states);
 
   // Calculate number of states (assume 65536 as default)
@@ -84,45 +84,34 @@ void GenerateRandIntKernelImpl(void* _states, void* _output, int64_t size,
 
   if (dtype.code == kDLInt && dtype.bits == 32) {
     int32_t* output = static_cast<int32_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<int32_t>(low),
-                                               static_cast<int32_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<int32_t>(low), static_cast<int32_t>(high), num_states);
   } else if (dtype.code == kDLInt && dtype.bits == 16) {
     int16_t* output = static_cast<int16_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<int16_t>(low),
-                                               static_cast<int16_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<int16_t>(low), static_cast<int16_t>(high), num_states);
   } else if (dtype.code == kDLInt && dtype.bits == 8) {
     int8_t* output = static_cast<int8_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<int8_t>(low),
-                                               static_cast<int8_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<int8_t>(low), static_cast<int8_t>(high), num_states);
   } else if (dtype.code == kDLUInt && dtype.bits == 32) {
     uint32_t* output = static_cast<uint32_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<uint32_t>(low),
-                                               static_cast<uint32_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<uint32_t>(low), static_cast<uint32_t>(high), num_states);
   } else if (dtype.code == kDLUInt && dtype.bits == 16) {
     uint16_t* output = static_cast<uint16_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<uint16_t>(low),
-                                               static_cast<uint16_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<uint16_t>(low), static_cast<uint16_t>(high), num_states);
   } else if (dtype.code == kDLUInt && dtype.bits == 8) {
     uint8_t* output = static_cast<uint8_t*>(_output);
-    KernelGenerateRandInt<<<blocks, threads>>>(states, output, size,
-                                               static_cast<uint8_t>(low),
-                                               static_cast<uint8_t>(high),
-                                               num_states);
+    KernelGenerateRandInt<<<blocks, threads, 0, stream>>>(
+        states, output, size, static_cast<uint8_t>(low), static_cast<uint8_t>(high), num_states);
   }
 }
 
-template<typename T>
-__global__ void KernelGenerateUniform(curandState* states, T* output, int64_t size, int64_t num_states) {
+template <typename T>
+__global__ void KernelGenerateUniform(curandState* states, T* output, int64_t size,
+                                      int64_t num_states) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
   if (idx < size) {
     // Use round-robin assignment of states to threads
@@ -138,7 +127,8 @@ __global__ void KernelGenerateUniform(curandState* states, T* output, int64_t si
   }
 }
 
-void GenerateUniformKernelImpl(void* _states, void* _output, int64_t size, DLDataType dtype) {
+void GenerateUniformKernelImpl(void* _states, void* _output, int64_t size, DLDataType dtype,
+                               cudaStream_t stream) {
   curandState* states = static_cast<curandState*>(_states);
 
   // Calculate number of states (assume 65536 as default)
@@ -149,13 +139,13 @@ void GenerateUniformKernelImpl(void* _states, void* _output, int64_t size, DLDat
 
   if (dtype.code == kDLFloat && dtype.bits == 32) {
     float* output = static_cast<float*>(_output);
-    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+    KernelGenerateUniform<<<blocks, threads, 0, stream>>>(states, output, size, num_states);
   } else if (dtype.code == kDLFloat && dtype.bits == 64) {
     double* output = static_cast<double*>(_output);
-    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+    KernelGenerateUniform<<<blocks, threads, 0, stream>>>(states, output, size, num_states);
   } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     half* output = static_cast<half*>(_output);
-    KernelGenerateUniform<<<blocks, threads>>>(states, output, size, num_states);
+    KernelGenerateUniform<<<blocks, threads, 0, stream>>>(states, output, size, num_states);
   }
 }
 

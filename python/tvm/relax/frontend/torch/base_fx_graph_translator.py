@@ -447,7 +447,6 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 return self.block_builder.emit(op(lhs, rhs))
 
             lhs, rhs = self.retrieve_args(node)
-            print(f"binary op: lhs, rhs: {lhs}, {rhs}")
             if isinstance(lhs, relax.Var) or isinstance(rhs, relax.Var):
                 return call_binary_op(relax_op, lhs, rhs)
             elif isinstance(lhs, relax.expr.Constant):
