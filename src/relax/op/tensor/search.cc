@@ -57,11 +57,11 @@ StructInfo InferStructInfoBucketize(const Call& call, const BlockBuilder& ctx) {
   TensorStructInfo input_tensor_info = input_sinfo[0];
   TensorStructInfo boundaries_info = input_sinfo[1];
 
-  if (!boundaries_info->IsUnknownNdim() && boundaries_info->ndim != 1) {
-    ctx->ReportFatal(Diagnostic::Error(call)
-                     << "Bucketize requires boundary to be 1-D array but got "
-                     << boundaries_info->ndim);
-  }
+  // if (!boundaries_info->IsUnknownNdim() && boundaries_info->ndim != 1) {
+  //   ctx->ReportFatal(Diagnostic::Error(call)
+  //                    << "Bucketize requires boundary to be 1-D array but got "
+  //                    << boundaries_info->ndim);
+  // }
 
   auto attrs = call->attrs.as<BucketizeAttrs>();
   DataType out_dtype;

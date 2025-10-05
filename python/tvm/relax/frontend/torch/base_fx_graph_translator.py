@@ -2187,6 +2187,18 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         )
         return self.block_builder.emit(out)
 
+    def _searchsorted_old(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        input_tensor = args[1]
+        boundaries = args[0]
+
+        right = node.kwargs.get("right", False)
+        out_int32 = node.kwargs.get("out_int32", False)
+
+        return self.block_builder.emit(
+            relax.op.bucketize(input_tensor, boundaries, out_int32, right)
+        )
+
     @abc.abstractmethod
     def create_convert_map(
         self,

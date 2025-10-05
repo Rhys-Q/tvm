@@ -124,6 +124,11 @@ class PermuteDimsAttrs(Attrs):
     """Attributes for permute_dims operator"""
 
 
+@tvm_ffi.register_object("relax.attrs.BucketizeAttrs")
+class BucketizeAttrs(Attrs):
+    """Attributes for bucketize operator"""
+
+
 @tvm_ffi.register_object("relax.attrs.SortAttrs")
 class SortAttrs(Attrs):
     """Attributes for sort operator"""
