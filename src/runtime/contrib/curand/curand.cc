@@ -141,9 +141,9 @@ struct DeferredFunc {
 
 // Implementation of CUDARandomEngine methods
 void CUDARandomEngine::Init(unsigned long seed) {
-  // if (initialized_) {
-  //   return;  // Already initialized
-  // }
+  if (initialized_) {
+    return;  // Already initialized
+  }
 
   // Set up device states for CUDA Graph compatible random generation
   max_states_ = 65536;  // Configurable number of states
