@@ -167,12 +167,13 @@ class SortScanDispatcher(BackendDispatcher):
                 out_dtype = call.attrs.dtype
                 out_dtype = out_dtype or in_dtype
                 cumsum_2d_shape = relax.ShapeExpr([dim, shape[-1]])
-                reshape = relax.call_pure_packed(
-                    "vm.builtin.reshape",
-                    call.args[0],
-                    cumsum_2d_shape,
-                    sinfo_args=relax.TensorStructInfo(cumsum_2d_shape, out_dtype),
-                )
+                # reshape = relax.call_pure_packed(
+                #     "vm.builtin.reshape",
+                #     call.args[0],
+                #     cumsum_2d_shape,
+                #     sinfo_args=relax.TensorStructInfo(cumsum_2d_shape, out_dtype),
+                # )
+                reshape = relax.op.reshape(call.args[0], cumsum_2d_shape)
                 gv = self.builder_.add_func(
                     gpu_2d_continuous_cumsum(in_dtype=in_dtype, out_dtype=out_dtype),
                     "gpu_2d_continuous_cumsum",
@@ -182,12 +183,13 @@ class SortScanDispatcher(BackendDispatcher):
                     reshape,
                     out_sinfo=relax.TensorStructInfo(cumsum_2d_shape, out_dtype),
                 )
-                return relax.call_pure_packed(
-                    "vm.builtin.reshape",
-                    cumsum,
-                    shape,
-                    sinfo_args=call.struct_info,
-                )
+                return relax.op.reshape(cumsum, shape)
+                # return relax.call_pure_packed(
+                #     "vm.builtin.reshape",
+                #     cumsum,
+                #     shape,
+                #     sinfo_args=call.struct_info,
+                # )
 
             with tgt:
                 if call.op.name == "relax.cumsum":
