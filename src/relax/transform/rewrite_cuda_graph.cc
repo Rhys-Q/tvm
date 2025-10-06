@@ -253,6 +253,8 @@ class CUDAGraphRewritePlanner : public ExprVisitor {
           Array<tir::Var> symbolic_vars = DefinableTIRVarsInStructInfo(
               Downcast<StructInfo>(func->params[i]->struct_info_.value()));
           if (i < num_inputs.IntValue()) {
+            // hack, fix it later
+            static_vars_.insert(func->params[i].get());
             for (const auto& symbolic_var : symbolic_vars) {
               if (capture_symbolic_var_name_hints.count(symbolic_var->name_hint)) {
                 capture_symbolic_vars_.insert(symbolic_var.get());
