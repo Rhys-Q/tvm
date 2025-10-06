@@ -365,11 +365,11 @@ def test_random_fill_mt():
 
 
 if __name__ == "__main__":
-    test_randint()
-    test_rand()
-    test_uniform()
+    # test_randint()
+    # test_rand()
+    # test_uniform()
     # test_normal()
     # test_random_fill()
     # test_random_fill_mt()
-    test_randint_cuda_graph_compatible()
+    # test_randint_cuda_graph_compatible()
     test_rand_cuda_graph_compatible()

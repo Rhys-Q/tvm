@@ -2152,10 +2152,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         dtype = self._convert_data_type(
             node.kwargs.get("dtype", torch.get_default_dtype()), self.env
         )
-        zeros_ = relax.op.zeros(shape=size, dtype=dtype)
         out = relax.call_dps_packed(
             "runtime.contrib.curand.Uniform",
-            [zeros_],
+            [],
             out_sinfo=[relax.TensorStructInfo(size, dtype)],
         )
 
@@ -2169,10 +2168,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         high = args[1]
         size = relax.ShapeExpr(args[2] if isinstance(args[2], (list, tuple)) else (args[2],))
         dtype = "int32"
-        zeros_ = relax.op.zeros(shape=size, dtype=dtype)
         out = relax.call_dps_packed(
             "runtime.contrib.curand.RandInt",
-            [low, high, zeros_],
+            [low, high],
             out_sinfo=[relax.TensorStructInfo(size, dtype)],
         )
 
