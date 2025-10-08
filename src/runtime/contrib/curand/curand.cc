@@ -25,6 +25,7 @@
 
 #include "../../cuda/cuda_common.h"
 #include "./helper_cuda_kernels.h"
+#include "load_numpy_bin.h"
 
 namespace tvm {
 namespace runtime {
@@ -225,6 +226,24 @@ void RandomFill(DLTensor* tensor) {
   // TVMSynchronize(tensor->device.device_type, tensor->device.device_type, nullptr);
 }
 
+float* load_rand_bin(std::string root_path, int cnt) {
+  NumpyBinLoader::ArrayInfo* info =
+      NumpyBinLoader::load(root_path + "/rand" + "_" + std::to_string(cnt) + ".bin");
+  LOG(INFO) << "load_rand_bin: " << root_path + "/rand" + "_" + std::to_string(cnt) + ".bin";
+  return NumpyBinLoader::get_data<float>(*info);
+}
+int* load_randint_bin(std::string root_path, int cnt) {
+  NumpyBinLoader::ArrayInfo* info =
+      NumpyBinLoader::load(root_path + "/randint" + "_" + std::to_string(cnt) + ".bin");
+  LOG(INFO) << "load_randint_bin: " << root_path + "/randint" + "_" + std::to_string(cnt) + ".bin";
+  return NumpyBinLoader::get_data<int>(*info);
+}
+
+
+
+std::string root_path = "/root/brother/color_model_deploy/output/random";
+static int randint_cnt = 1;
+static int rand_cnt = 1;
 TVM_FFI_STATIC_INIT_BLOCK({
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
@@ -251,20 +270,59 @@ TVM_FFI_STATIC_INIT_BLOCK({
                     entry->cuda_random_engine.GenerateRandIntKernel(out->data, tensor_size, low,
                                                                     high, out->dtype, stream);
                   })
-      .def_packed("runtime.contrib.curand.Uniform", [](ffi::PackedArgs args, ffi::Any* ret) {
-        CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
-        auto out = args[0].cast<DLTensor*>();
+      .def_packed("runtime.contrib.curand.Uniform",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    CUDARandomThreadLocalEntry* entry = CUDARandomThreadLocalEntry::ThreadLocal();
+                    auto out = args[0].cast<DLTensor*>();
 
+                    ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
+                        << "CUDARandomEngine only works on CUDA devices";
+                    ICHECK(out->dtype.code == DLDataTypeCode::kDLFloat)
+                        << "Uniform random generation only supports float types";
+
+                    int64_t tensor_size = GetTensorSize(out);
+                    cudaStream_t stream = static_cast<cudaStream_t>(
+                        TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
+                    entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size,
+                                                                    out->dtype, stream);
+                  })
+      .def_packed("runtime.contrib.curand.RandInt1",
+                  [](ffi::PackedArgs args, ffi::Any* ret) {
+                    auto out = args[2].cast<DLTensor*>();
+
+                    cudaStream_t stream = static_cast<cudaStream_t>(
+                        TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
+                    int64_t tensor_size = GetTensorSize(out);
+                    int* randint_data = load_randint_bin(root_path, randint_cnt);
+                    randint_cnt++;
+                    if (randint_cnt == 61){
+                      randint_cnt = 1;
+                    }
+                    cudaMemcpyAsync(out->data, randint_data, tensor_size * sizeof(int),
+                                    cudaMemcpyHostToDevice, stream);
+                    ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
+                        << "CUDARandomEngine only works on CUDA devices";
+                  })
+      .def_packed("runtime.contrib.curand.Uniform1", [](ffi::PackedArgs args, ffi::Any* ret) {
+        auto out = args[0].cast<DLTensor*>();
+        int64_t tensor_size = GetTensorSize(out);
+        cudaStream_t stream =
+            static_cast<cudaStream_t>(TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
         ICHECK(out->device.device_type == DLDeviceType::kDLCUDA)
             << "CUDARandomEngine only works on CUDA devices";
         ICHECK(out->dtype.code == DLDataTypeCode::kDLFloat)
             << "Uniform random generation only supports float types";
 
-        int64_t tensor_size = GetTensorSize(out);
-        cudaStream_t stream =
-            static_cast<cudaStream_t>(TVMFFIEnvGetCurrentStream(kDLCUDA, out->device.device_id));
-        entry->cuda_random_engine.GenerateUniformKernel(out->data, tensor_size, out->dtype, stream);
+        float* rand_data =
+            load_rand_bin("/root/brother/color_model_deploy/output/random", rand_cnt);
+        rand_cnt++;
+        if (rand_cnt == 61){
+          rand_cnt = 1;
+        }
+        cudaMemcpyAsync(out->data, rand_data, tensor_size * sizeof(float), cudaMemcpyHostToDevice,
+                        stream);
       });
+  ;
 });
 
 }  // namespace curand
