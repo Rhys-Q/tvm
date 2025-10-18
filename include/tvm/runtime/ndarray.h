@@ -81,6 +81,7 @@ class NDArray : public tvm::ffi::NDArray {
    */
   inline void CopyFrom(const DLTensor* other);
   inline void CopyFrom(const NDArray& other);
+  inline void CopyFrom(const NDArray& other, TVMStreamHandle stream);
   /*!
    * \brief Copy data content from a byte buffer.
    * \param data The source bytes to be copied from.
@@ -89,6 +90,8 @@ class NDArray : public tvm::ffi::NDArray {
    * \note The copy always triggers a TVMSynchronize.
    */
   TVM_DLL void CopyFromBytes(const void* data, size_t nbytes);
+
+  TVM_DLL void CopyFromBytes(const void* data, size_t nbytes, TVMStreamHandle stream);
   /*!
    * \brief Copy data content into another array.
    * \param other The source array to be copied from.
@@ -105,6 +108,7 @@ class NDArray : public tvm::ffi::NDArray {
    * \note The copy always triggers a TVMSynchronize.
    */
   TVM_DLL void CopyToBytes(void* data, size_t nbytes) const;
+  TVM_DLL void CopyToBytes(void* data, size_t nbytes, TVMStreamHandle stream);
   /*!
    * \brief Copy the data to another device.
    * \param dev The target device.
@@ -193,6 +197,13 @@ inline void NDArray::CopyFrom(const NDArray& other) {
   ICHECK(data_ != nullptr);
   ICHECK(other.data_ != nullptr);
   CopyFromTo(other.get_mutable(), get_mutable());
+}
+
+inline void NDArray::CopyFrom(const NDArray& other, TVMStreamHandle stream) {
+  ICHECK(data_ != nullptr);
+  ICHECK(other.data_ != nullptr);
+  CopyFromTo(other.get_mutable(), get_mutable(), stream);
+  DeviceAPI::Get(get_mutable()->device)->StreamSync(get_mutable()->device, stream);
 }
 
 inline void NDArray::CopyTo(DLTensor* other) const {

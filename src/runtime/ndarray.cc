@@ -59,7 +59,8 @@ inline void VerifyDataType(DLDataType dtype) {
   ICHECK_EQ(dtype.bits & (dtype.bits - 1), 0);
 }
 
-void ArrayCopyFromBytes(DLTensor* handle, const void* data, size_t nbytes) {
+void ArrayCopyFromBytes(DLTensor* handle, const void* data, size_t nbytes,
+                        TVMStreamHandle stream = nullptr) {
   size_t arr_size = GetDataSize(*handle);
   ICHECK_EQ(arr_size, nbytes) << "ArrayCopyFromBytes: size mismatch";
   ICHECK(IsContiguous(*handle)) << "ArrayCopyFromBytes only support contiguous array for now";
@@ -72,9 +73,9 @@ void ArrayCopyFromBytes(DLTensor* handle, const void* data, size_t nbytes) {
   from.shape = handle->shape;
   from.strides = nullptr;
   from.byte_offset = 0;
-  DeviceAPI::Get(handle->device)->CopyDataFromTo(&from, handle, nullptr);
+  DeviceAPI::Get(handle->device)->CopyDataFromTo(&from, handle, stream);
   // Synchronize in case data become unavailable later.
-  DeviceAPI::Get(handle->device)->StreamSync(handle->device, nullptr);
+  DeviceAPI::Get(handle->device)->StreamSync(handle->device, stream);
 }
 
 void NDArray::CopyToBytes(const DLTensor* handle, void* data, size_t nbytes,
@@ -175,10 +176,22 @@ void NDArray::CopyToBytes(void* data, size_t nbytes) const {
   NDArray::CopyToBytes(get_mutable(), data, nbytes);
 }
 
+void NDArray::CopyToBytes(void* data, size_t nbytes, TVMStreamHandle stream) {
+  ICHECK(data != nullptr);
+  ICHECK(data_ != nullptr);
+  NDArray::CopyToBytes(get_mutable(), data, nbytes, stream);
+}
+
 void NDArray::CopyFromBytes(const void* data, size_t nbytes) {
   ICHECK(data != nullptr);
   ICHECK(data_ != nullptr);
-  ArrayCopyFromBytes(get_mutable(), data, nbytes);
+  ArrayCopyFromBytes(get_mutable(), data, nbytes, nullptr);
+}
+
+void NDArray::CopyFromBytes(const void* data, size_t nbytes, TVMStreamHandle stream) {
+  ICHECK(data != nullptr);
+  ICHECK(data_ != nullptr);
+  ArrayCopyFromBytes(get_mutable(), data, nbytes, stream);
 }
 
 NDArray NDArray::CopyTo(const Device& dev, Optional<String> mem_scope) const {
