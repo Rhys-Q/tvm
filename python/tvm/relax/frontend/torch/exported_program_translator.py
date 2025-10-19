@@ -248,10 +248,17 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     def _slice(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
-        axes = [node.args[1]]
-        begin = [node.args[2]]
-        end = [node.args[3]]
-        stride = [node.args[4] if len(node.args) > 4 else 1]
+        if len(node.args) == 1:
+            kwargs = node.kwargs
+            axes = kwargs.get('dim', 0)
+            begin = kwargs['start']
+            end = kwargs['end']
+            stride = kwargs.get('step', 1)
+        else:
+            axes = [node.args[1]]
+            begin = [node.args[2]]
+            end = [node.args[3]]
+            stride = [node.args[4] if len(node.args) > 4 else 1]
         return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
 
     def _unflatten(self, node: fx.Node) -> relax.Var:
@@ -444,6 +451,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "max.default": self._unary_op(relax.op.max),
             "min.default": self._unary_op(relax.op.min),
             "minimum.default": self._binary_op(relax.op.minimum, min),
+            "maximum.default": self._binary_op(relax.op.maximum, max),
             "remainder.Tensor": self._binary_op(relax.op.floor_mod, operator.mod),
             "remainder.Scalar": self._binary_op(relax.op.floor_mod, operator.mod),
             "mul.Tensor": self._binary_op(relax.op.multiply, operator.mul),
