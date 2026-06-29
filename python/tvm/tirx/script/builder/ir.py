@@ -105,19 +105,32 @@ from .external_kernel import call_kernel
 class EventTensor:
     """Python-side metadata for an Event Tensor buffer."""
 
-    __slots__ = ("shape", "init", "name")
+    _is_meta_class = True
 
-    def __init__(self, shape: tuple[PrimExpr, ...], init: PrimExpr, name: str):
+    def __init__(
+        self,
+        buffer: Buffer,
+        shape: tuple[PrimExpr, ...],
+        init: PrimExpr,
+        name: str,
+        scope: str,
+        ptx_scope: str,
+        ptx_space: str,
+    ):
+        self.buffer = buffer
         self.shape = shape
         self.init = init
         self.name = name
+        self.scope = scope
+        self.ptx_scope = ptx_scope
+        self.ptx_space = ptx_space
 
 
 _EVENT_TENSOR_META: dict[int, EventTensor] = {}
 
 
 class ReadyQueue:
-    """Python-side metadata for a simple shared-memory ready queue."""
+    """Python-side metadata for a simple ready queue."""
 
     _is_meta_class = True
 
@@ -129,6 +142,10 @@ class ReadyQueue:
         head: Buffer,
         tail: Buffer,
         pending: Buffer,
+        lock: Buffer | None,
+        scope: str,
+        ptx_scope: str,
+        ptx_space: str,
     ):
         self.capacity = capacity
         self.task_fields = task_fields
@@ -136,6 +153,10 @@ class ReadyQueue:
         self.head = head
         self.tail = tail
         self.pending = pending
+        self.lock = lock
+        self.scope = scope
+        self.ptx_scope = ptx_scope
+        self.ptx_space = ptx_space
 
 
 def _as_tuple(value) -> tuple:
@@ -153,7 +174,30 @@ def _event_numel(shape: tuple[PrimExpr, ...]) -> PrimExpr:
     return numel
 
 
-def _event_flat_index(event: Buffer, indices) -> PrimExpr:
+def _buffer_storage_scope(buf: Buffer) -> str:
+    scope_attr = getattr(buf, "scope", None)
+    if callable(scope_attr):
+        return str(scope_attr())
+    if scope_attr is not None:
+        return str(scope_attr)
+    ptr_ty = getattr(getattr(buf, "data", None), "type_annotation", None)
+    storage_scope = getattr(ptr_ty, "storage_scope", "")
+    return str(storage_scope or "global")
+
+
+def _ptx_scope_space_for_buffer(buf: Buffer) -> tuple[str, str]:
+    scope = _buffer_storage_scope(buf)
+    if scope == "global":
+        return "gpu", "global"
+    if scope == "shared":
+        return "cta", "shared"
+    raise ValueError(
+        "EventTensor and ReadyQueue backing buffers currently support only "
+        f"global or shared scope, but got {scope!r}"
+    )
+
+
+def _event_flat_index(event: Buffer | EventTensor, indices) -> PrimExpr:
     meta = _require_event_tensor(event)
     indices = _as_tuple(indices)
     if len(indices) != len(meta.shape):
@@ -948,17 +992,27 @@ def alloc_buffer(
 
 def event_tensor(
     shape: list[PrimExpr] | tuple[PrimExpr, ...] | PrimExpr | Integral,
-    init: PrimExpr | Integral,
+    init: PrimExpr | Integral | None = None,
     dtype: str = "int32",
     scope: str = "global",
     name: str = "",
-) -> Buffer:
+    *,
+    wait_count: PrimExpr | Integral | None = None,
+    storage: Buffer | None = None,
+) -> EventTensor:
     """Declare an Event Tensor in the current PrimFunc.
 
-    Event Tensor storage is currently represented as a flat global int32
-    buffer with a marker annotation.  The public handle keeps the logical
-    multidimensional event shape and default initialization value.
+    When ``storage`` is provided, it is used as the backing buffer.  This is
+    the production path for global Event Tensors because CUDA kernels cannot
+    allocate global memory internally.  When omitted, a shared-memory backing
+    buffer is allocated for single-CTA prototyping and existing smoke tests.
     """
+    if wait_count is not None:
+        if init is not None:
+            raise ValueError("specify either init or wait_count, not both")
+        init = wait_count
+    if init is None:
+        raise ValueError("EventTensor requires init or wait_count")
     if dtype != "int32":
         raise ValueError("EventTensor currently supports only int32 counters")
     if scope != "global":
@@ -971,12 +1025,32 @@ def event_tensor(
     annotations = {"tirx.event_tensor": True, "tirx.event_tensor_scope": scope}
     if name:
         annotations["tirx.event_tensor_name"] = String(name)
-    buf = alloc_buffer((numel,), dtype=dtype, scope="shared", annotations=annotations)
-    _EVENT_TENSOR_META[id(buf)] = EventTensor(logical_shape, init, name or buf.name)
-    return buf
+    if storage is None:
+        # Compatibility path for current single-CTA examples.  The logical
+        # scope remains global, but actual storage is shared and only correct
+        # when all producers/consumers are in the same CTA.
+        buf = alloc_buffer((numel,), dtype=dtype, scope="shared", annotations=annotations)
+    else:
+        if not isinstance(storage, Buffer):
+            raise TypeError("EventTensor storage must be a TIRx Buffer")
+        if storage.dtype != dtype:
+            raise ValueError(
+                f"EventTensor storage dtype must be {dtype}, but got {storage.dtype}"
+            )
+        buf = storage
+    actual_scope = _buffer_storage_scope(buf)
+    ptx_scope, ptx_space = _ptx_scope_space_for_buffer(buf)
+    handle = EventTensor(
+        buf, logical_shape, init, name or buf.name, actual_scope, ptx_scope, ptx_space
+    )
+    _EVENT_TENSOR_META[id(buf)] = handle
+    _EVENT_TENSOR_META[id(handle)] = handle
+    return handle
 
 
-def _require_event_tensor(event: Buffer) -> EventTensor:
+def _require_event_tensor(event: Buffer | EventTensor) -> EventTensor:
+    if isinstance(event, EventTensor):
+        return event
     if not isinstance(event, Buffer):
         raise TypeError("expected an EventTensor returned by T.event_tensor")
     meta = _EVENT_TENSOR_META.get(id(event))
@@ -985,28 +1059,28 @@ def _require_event_tensor(event: Buffer) -> EventTensor:
     return meta
 
 
-def event_init(event: Buffer) -> None:
+def event_init(event: Buffer | EventTensor) -> None:
     """Initialize every element of an Event Tensor to its default init value."""
     meta = _require_event_tensor(event)
     i = Var("event_i", "int32")
-    body = tir.BufferStore(event, meta.init, [i])
+    body = tir.BufferStore(meta.buffer, meta.init, [i])
     add_to_parent(tir.For(i, 0, _event_numel(meta.shape), tir.ForKind.SERIAL, body))
 
 
-def event_reset(event: Buffer, indices, value: PrimExpr | Integral) -> None:
+def event_reset(event: Buffer | EventTensor, indices, value: PrimExpr | Integral) -> None:
     """Set one Event Tensor element to ``value``."""
-    _require_event_tensor(event)
-    add_to_parent(tir.BufferStore(event, value, [_event_flat_index(event, indices)]))
+    meta = _require_event_tensor(event)
+    add_to_parent(tir.BufferStore(meta.buffer, value, [_event_flat_index(event, indices)]))
 
 
-def event_wait(event: Buffer, indices, backoff: int = 0) -> None:
+def event_wait(event: Buffer | EventTensor, indices, backoff: int = 0) -> None:
     """Spin until one Event Tensor element reaches zero."""
-    _require_event_tensor(event)
+    meta = _require_event_tensor(event)
     idx = _event_flat_index(event, indices)
     from tvm.backend.cuda import op as _cuda_op  # pylint: disable=import-outside-toplevel
 
     value = _cuda_op.ptx_ld_acquire(
-        event.ptr_to([idx]), "int32", "s32", scope="cta", space="shared"
+        meta.buffer.ptr_to([idx]), "int32", "s32", scope=meta.ptx_scope, space=meta.ptx_space
     )
     if backoff > 0:
         body = tir.Evaluate(_cuda_op.cuda_nano_sleep(backoff))
@@ -1015,22 +1089,22 @@ def event_wait(event: Buffer, indices, backoff: int = 0) -> None:
     add_to_parent(tir.While(value != 0, body))
 
 
-def event_notify(event: Buffer, indices) -> PrimExpr:
+def event_notify(event: Buffer | EventTensor, indices) -> PrimExpr:
     """Atomic-decrement one Event Tensor element.
 
     Returns ``old_value == 1``, which is true for the last producer reaching
     the event.
     """
-    _require_event_tensor(event)
+    meta = _require_event_tensor(event)
     idx = _event_flat_index(event, indices)
     from tvm.backend.cuda import op as _cuda_op  # pylint: disable=import-outside-toplevel
 
     old_value = _cuda_op.ptx_atom_scalar(
-        event.ptr_to([idx]),
+        meta.buffer.ptr_to([idx]),
         IntImm("int32", -1),
         sem="release",
-        scope="cta",
-        space="shared",
+        scope=meta.ptx_scope,
+        space=meta.ptx_space,
         op="add",
         ptx_type="s32",
     )
@@ -1041,12 +1115,18 @@ def ready_queue(
     capacity: PrimExpr | Integral,
     task_fields: int,
     scope: str = "global",
+    *,
+    storage: Buffer | None = None,
+    head: Buffer | None = None,
+    tail: Buffer | None = None,
+    pending: Buffer | None = None,
+    lock: Buffer | None = None,
 ) -> ReadyQueue:
     """Create a simple ready queue for dynamic megakernel scheduling.
 
-    The first implementation lowers to shared-memory storage so it compiles in
-    the existing CUDA path.  The public API keeps ``scope='global'`` as the
-    logical contract for later global queue lowering.
+    When all backing buffers are supplied, the queue uses those buffers.  This
+    is the production path for global queues.  When omitted, shared-memory
+    backing buffers are allocated for single-CTA prototyping.
     """
     if scope != "global":
         raise ValueError("ReadyQueue currently supports only logical global scope")
@@ -1055,21 +1135,78 @@ def ready_queue(
     if isinstance(capacity, int) and capacity <= 0:
         raise ValueError("ReadyQueue capacity must be positive")
 
-    storage = alloc_buffer(
-        (capacity, task_fields),
-        dtype="int32",
-        scope="shared",
-        annotations={"tirx.ready_queue": True, "tirx.ready_queue_scope": scope},
+    supplied = [
+        storage is not None,
+        head is not None,
+        tail is not None,
+        pending is not None,
+        lock is not None,
+    ]
+    if any(supplied) and not all(supplied):
+        raise ValueError("ReadyQueue requires storage, head, tail, pending, and lock together")
+    owns_storage = storage is None
+    if owns_storage:
+        storage = alloc_buffer(
+            (capacity, task_fields),
+            dtype="int32",
+            scope="shared",
+            annotations={"tirx.ready_queue": True, "tirx.ready_queue_scope": scope},
+        )
+        head = alloc_buffer(
+            (1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True}
+        )
+        tail = alloc_buffer(
+            (1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True}
+        )
+        pending = alloc_buffer(
+            (1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True}
+        )
+        lock = alloc_buffer(
+            (1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True}
+        )
+    else:
+        for name, buf in (
+            ("storage", storage),
+            ("head", head),
+            ("tail", tail),
+            ("pending", pending),
+            ("lock", lock),
+        ):
+            if not isinstance(buf, Buffer):
+                raise TypeError(f"ReadyQueue {name} must be a TIRx Buffer")
+            if buf.dtype != "int32":
+                raise ValueError(f"ReadyQueue {name} must have int32 dtype, got {buf.dtype}")
+        if len(storage.shape) != 2:
+            raise ValueError("ReadyQueue storage must be rank-2 [capacity, task_fields]")
+        if (
+            len(head.shape) != 1
+            or len(tail.shape) != 1
+            or len(pending.shape) != 1
+            or len(lock.shape) != 1
+        ):
+            raise ValueError("ReadyQueue head, tail, pending, and lock must be rank-1 buffers")
+    actual_scope = _buffer_storage_scope(storage)
+    for name, buf in (("head", head), ("tail", tail), ("pending", pending), ("lock", lock)):
+        if _buffer_storage_scope(buf) != actual_scope:
+            raise ValueError("ReadyQueue backing buffers must all use the same storage scope")
+    ptx_scope, ptx_space = _ptx_scope_space_for_buffer(storage)
+    if owns_storage:
+        buffer_store(head, 0, [0])
+        buffer_store(tail, 0, [0])
+        buffer_store(pending, 0, [0])
+        buffer_store(lock, 0, [0])
+    return ReadyQueue(
+        capacity,
+        task_fields,
+        storage,
+        head,
+        tail,
+        pending,
+        lock,
+        actual_scope,
+        ptx_scope,
+        ptx_space,
     )
-    head = alloc_buffer((1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True})
-    tail = alloc_buffer((1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True})
-    pending = alloc_buffer(
-        (1,), dtype="int32", scope="shared", annotations={"tirx.ready_queue": True}
-    )
-    buffer_store(head, 0, [0])
-    buffer_store(tail, 0, [0])
-    buffer_store(pending, 0, [0])
-    return ReadyQueue(capacity, task_fields, storage, head, tail, pending)
 
 
 def _require_ready_queue(queue: ReadyQueue) -> ReadyQueue:
@@ -1078,18 +1215,50 @@ def _require_ready_queue(queue: ReadyQueue) -> ReadyQueue:
     return queue
 
 
+def _queue_acquire_lock(queue: ReadyQueue) -> None:
+    if queue.scope != "global":
+        return
+    from tvm.backend.cuda import op as _cuda_op  # pylint: disable=import-outside-toplevel
+
+    old = _cuda_op.cuda_atomic_cas(queue.lock.ptr_to([0]), IntImm("int32", 0), IntImm("int32", 1))
+    add_to_parent(tir.While(old != 0, tir.Evaluate(_cuda_op.cuda_nano_sleep(64))))
+
+
+def _queue_release_lock(queue: ReadyQueue) -> None:
+    if queue.scope != "global":
+        return
+    from tvm.backend.cuda import op as _cuda_op  # pylint: disable=import-outside-toplevel
+
+    add_to_parent(
+        tir.Evaluate(
+            _cuda_op.ptx_atom_scalar(
+                queue.lock.ptr_to([0]),
+                IntImm("int32", 0),
+                sem="release",
+                scope=queue.ptx_scope,
+                space=queue.ptx_space,
+                op="exch",
+                ptx_type="b32",
+            )
+        )
+    )
+
+
 def queue_push(queue: ReadyQueue, *fields: PrimExpr | Integral) -> None:
     """Push one task descriptor into a ReadyQueue."""
     queue = _require_ready_queue(queue)
     if len(fields) != queue.task_fields:
         raise ValueError(
             f"ReadyQueue expects {queue.task_fields} task fields, but received {len(fields)}"
-    )
+        )
+    _queue_acquire_lock(queue)
     slot = Bind(queue.tail[0])
+    Assert(slot < queue.capacity, "ReadyQueue overflow")
     buffer_store(queue.tail, slot + 1, [0])
     for i, value in enumerate(fields):
         buffer_store(queue.storage, value, [slot, i])
     buffer_store(queue.pending, queue.pending[0] + 1, [0])
+    _queue_release_lock(queue)
 
 
 def queue_pop(queue: ReadyQueue):
@@ -1099,6 +1268,7 @@ def queue_pop(queue: ReadyQueue):
     values are zero placeholders.
     """
     queue = _require_ready_queue(queue)
+    _queue_acquire_lock(queue)
     slot = Bind(queue.head[0])
     ok = slot < queue.tail[0]
     buffer_store(queue.head, Select(ok, slot + 1, queue.head[0]), [0])
@@ -1106,6 +1276,7 @@ def queue_pop(queue: ReadyQueue):
         Select(ok, queue.storage[slot, i], IntImm("int32", 0))
         for i in range(queue.task_fields)
     ]
+    _queue_release_lock(queue)
     return (ok, *fields)
 
 
@@ -1118,7 +1289,10 @@ def queue_live(queue: ReadyQueue) -> PrimExpr:
 def queue_finish(queue: ReadyQueue) -> None:
     """Mark the currently popped task as finished."""
     queue = _require_ready_queue(queue)
+    _queue_acquire_lock(queue)
+    Assert(queue.pending[0] > 0, "ReadyQueue finish called with no live task")
     buffer_store(queue.pending, queue.pending[0] - 1, [0])
+    _queue_release_lock(queue)
 
 
 def wg_reg_tile(elem_per_thread: int, dtype: str = "float32") -> Buffer:
@@ -3841,16 +4015,6 @@ __all__ += [
     "Var",
     "add_to_parent",
     "alloc_cast_frag",
-    "event_init",
-    "event_notify",
-    "event_reset",
-    "event_tensor",
-    "event_wait",
-    "queue_finish",
-    "queue_live",
-    "queue_pop",
-    "queue_push",
-    "ready_queue",
     "alloc_local",
     "alloc_scalar",
     "alloc_shared",
@@ -3861,9 +4025,19 @@ __all__ += [
     "cta_id_in_pair",
     "decl_scalar",
     "device_entry",
+    "event_init",
+    "event_notify",
+    "event_reset",
+    "event_tensor",
+    "event_wait",
     "lane_id",
     "local_scalar",
     "meta_class",
+    "queue_finish",
+    "queue_live",
+    "queue_pop",
+    "queue_push",
+    "ready_queue",
     "register_script_namespace",
     "scalar_wrapper",
     "scope_id",

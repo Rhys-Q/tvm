@@ -99,6 +99,7 @@ E = T.event_tensor(
     dtype="int32",
     scope="global",
     name=None,
+    storage=None,
 )
 
 T.event_init(E)
@@ -112,6 +113,8 @@ is_triggered = T.event_notify(E, indices)
 - `T.event_tensor` 声明一个 Event Tensor handle。
 - `shape` 是 event space shape，允许包含 symbolic shape。
 - `wait_count` 是默认初始 counter，可以是常量或 `PrimExpr`。
+- `storage` 是可选 backing buffer。正式 global Event Tensor 必须传入 global buffer；
+  不传时只允许作为 single-CTA shared-memory prototype。
 - `T.event_init(E)` 初始化所有 event 元素为默认 `wait_count`。
 - `T.event_reset(E, indices, value)` 设置单个 event counter，用于 data-dependent wait count。
 - `T.event_wait(E, indices)` 等待目标 counter 到 0。
@@ -131,10 +134,11 @@ dynamic schedule 可用它 push 后继 consumer tasks。
 - dynamic schedule 中任意 SM 都可能 notify 或消费同一个 event。
 - shared memory 只在单 CTA 内可见，不能作为跨 SM 依赖的正确实现。
 
-因此第一版正式 lowering 使用 global backing buffer：
+CUDA codegen 不允许 kernel 内部动态分配 global memory，因此第一版正式 lowering 使用由调用方
+传入的 global backing buffer：
 
 ```text
-int32 event_storage[num_events]
+E_storage: int32[num_events]
 ```
 
 多维 event index flatten 到线性 index：
@@ -143,9 +147,9 @@ int32 event_storage[num_events]
 flat = (((i0 * shape1) + i1) * shape2 + i2) ...
 ```
 
-当前已有 TIRx prototype 可以用 shared memory 支撑 single-CTA demo，但文档和最终实现
-不把 shared memory 作为 Event Tensor 的语义存储。shared memory 只能作为局部优化，例如
-同 CTA 内 event 或 global counter 的 cache，但必须保持 global 语义等价。
+不显式传入 `storage` 时，TIRx helper 可以分配 shared memory 支撑 single-CTA demo，但文档
+和最终实现不把 shared memory 作为 Event Tensor 的正式语义存储。shared memory 只能作为
+局部优化，例如同 CTA 内 event 或 global counter 的 cache，但必须保持 global 语义等价。
 
 ### 3.3 同步方式
 
@@ -181,7 +185,16 @@ start flag 让其他 CTA 等待初始化完成。
 Dynamic schedule 需要 GPU 端 ready queue。TIRx script 暴露以下 API：
 
 ```python
-Q = T.ready_queue(capacity, task_fields, scope="global")
+Q = T.ready_queue(
+    capacity,
+    task_fields,
+    scope="global",
+    storage=None,
+    head=None,
+    tail=None,
+    pending=None,
+    lock=None,
+)
 T.queue_push(Q, task_type, *coords)
 ok, task_type, *coords = T.queue_pop(Q)
 live = T.queue_live(Q)
@@ -195,6 +208,7 @@ storage[capacity, task_fields]
 head
 tail
 pending_tasks
+lock
 ```
 
 语义：
@@ -203,9 +217,12 @@ pending_tasks
 - `queue_pop` 从 queue 中取一个 task descriptor，成功时返回 `ok=True`。
 - `queue_finish` 在 task body 和所有后继 push 完成后减少 `pending_tasks`。
 - `queue_live` 返回未完成 task 数，persistent loop 使用 `queue_live(Q) > 0` 判断退出。
+- `lock` 是第一版 centralized queue 的互斥锁，用 atomicCAS 获取和释放；后续可替换为
+  lock-free 或 per-SM queue。
 
-第一版使用 centralized global queue，优点是实现简单，缺点是高并发下 head/tail 原子操作
-可能有竞争。后续可优化为 per-SM queue、work stealing、分片 queue，但不改变 API。
+第一版使用 centralized global queue，优点是实现简单和语义清楚，缺点是 lock 会限制高并发
+性能。后续可优化为 per-SM queue、work stealing、分片 queue 或 lock-free queue，但不改变
+上层 Event Tensor graph 语义。
 
 ## 5. Static Schedule Lowering
 
@@ -264,7 +281,7 @@ def megakernel(A, C, workspace):
     sm = T.cta_id([SM_COUNT])
     tx = T.thread_id([THREADS])
 
-    E = T.event_tensor((...), wait_count=...)
+    E = T.event_tensor((...), wait_count=..., storage=E_storage)
     T.event_init(E)
     T.grid_init_barrier()
 
@@ -316,8 +333,16 @@ def megakernel_dynamic(A, C, workspace):
     sm = T.cta_id([SM_COUNT])
     tx = T.thread_id([THREADS])
 
-    E = T.event_tensor((...), wait_count=...)
-    Q = T.ready_queue(capacity=..., task_fields=...)
+    E = T.event_tensor((...), wait_count=..., storage=E_storage)
+    Q = T.ready_queue(
+        capacity=...,
+        task_fields=...,
+        storage=Q_storage,
+        head=Q_head,
+        tail=Q_tail,
+        pending=Q_pending,
+        lock=Q_lock,
+    )
 
     if sm == 0 and tx == 0:
         T.event_init(E)
@@ -434,8 +459,8 @@ def raw_sum_static(A, C, workspace):
     sm = T.cta_id([SM_COUNT])
     tx = T.thread_id([THREADS])
 
-    E = T.event_tensor((n,), wait_count=4)
-    B = T.alloc_buffer((n * 32, 4), "float32", scope="global")
+    E = T.event_tensor((n,), wait_count=4, storage=E_storage)
+    B = B_workspace
 
     T.event_init(E)
     T.grid_init_barrier()
@@ -463,9 +488,17 @@ def raw_sum_dynamic(A, C, workspace):
     sm = T.cta_id([SM_COUNT])
     tx = T.thread_id([THREADS])
 
-    E = T.event_tensor((n,), wait_count=4)
-    B = T.alloc_buffer((n * 32, 4), "float32", scope="global")
-    Q = T.ready_queue(capacity=n * 5, task_fields=3)
+    E = T.event_tensor((n,), wait_count=4, storage=E_storage)
+    B = B_workspace
+    Q = T.ready_queue(
+        capacity=n * 5,
+        task_fields=3,
+        storage=Q_storage,
+        head=Q_head,
+        tail=Q_tail,
+        pending=Q_pending,
+        lock=Q_lock,
+    )
 
     if sm == 0 and tx == 0:
         T.event_init(E)
@@ -514,6 +547,7 @@ ReadyQueue {
   head
   tail
   pending_tasks
+  lock
 }
 ```
 
@@ -538,8 +572,8 @@ ReadyQueue {
 新增 `tirx.transform.LowerReadyQueue()`：
 
 - 创建 global queue storage、head、tail、pending。
-- lowering `queue_push` 到 tail atomic reserve、descriptor store、pending increment。
-- lowering `queue_pop` 到 head atomic reserve 和 bounds check。
+- lowering `queue_push` 到 lock acquire、descriptor store、tail/pending update、lock release。
+- lowering `queue_pop` 到 lock acquire、head/tail check、head update、lock release。
 - lowering `queue_finish` 到 pending decrement。
 - lowering `queue_live` 到 acquire load pending。
 
