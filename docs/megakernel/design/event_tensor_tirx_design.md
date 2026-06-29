@@ -17,396 +17,654 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# 基于 TIRx PrimFunc 的 Event Tensor 设计方案
+# 基于 TIRx 的 Event Tensor 设计方案
 
-## 1. 背景和目标
+## 1. 目标
 
-Event Tensor 是 dynamic megakernel 中表达细粒度 task 依赖的抽象。论文
-`docs/megakernel/2604.13327v2.pdf` 中的核心语义是：一个多维事件数组的每个元素
-维护 wait count，producer task 完成后通知事件，consumer task 在事件满足后执行。
+本文设计如何在 TVM TIRx 中实现论文
+`docs/megakernel/2604.13327v2.pdf` 的 Event Tensor 抽象，并支持
+`docs/megakernel/tasks/fake_example.py` 中的 raw sum graph 编译为单个
+megakernel。设计目标是：
 
-本设计选择 **不新增 graph function、TaskGraph、`mk.device_func`、`call_device` 或
-`mk.workspace`**。第一版直接把 megakernel 写成普通 TIRx `PrimFunc`：
+- 用 Event Tensor 表达 tile task 之间的细粒度依赖。
+- 支持 static schedule：任务队列编译期或 host 侧预先确定。
+- 支持 dynamic schedule：GPU 端 ready queue 根据 Event Tensor 触发后继任务。
+- 将 `graph_func`、`device_func`、`call_device` 映射到 TIRx 可实现的 API 和 lowering。
+- 明确 Event Tensor 的存储、同步、运行时状态和测试验收方式。
 
-- task 计算用 `T.inline` 或普通 TIRx 代码片段表达。
-- static schedule 用 `PrimFunc` 内的 schedule table、persistent loop 和 `if/switch`
-  dispatch 表达。
-- dynamic schedule 用 `PrimFunc` 内的 ready queue、event counter 和 persistent loop
-  表达。
-- Event Tensor 只作为 TIRx script/IR 中的依赖计数器抽象，后续 lowering 到 buffer、
-  atomic、load/store 和 `while`。
+本文不要求第一版自动从任意 Relax/TIR graph 推导 Event Tensor graph。第一版以显式
+Event Tensor graph 输入为边界，先打通 task graph 到 persistent TIRx megakernel 的设计。
 
-这样做的好处是最小化新抽象：TIRx 现有 `PrimFunc` 已经能表达 host/device 混合代码、
-`T.device_entry()` device region、buffer、控制流、内联 helper、CUDA atomic 和后端
-intrinsic。Event Tensor 不需要承担 task graph 前端职责。
+## 2. 编程模型
 
-第一版目标：
+Event Tensor 程序由三层概念组成。
 
-- 在 TIRx `PrimFunc` 中支持 `T.event_tensor`、`T.event_wait`、`T.event_notify`。
-- 支持 static schedule 和 dynamic schedule 两种写法。
-- 用论文中的 row/raw sum 作为 demo。
-- 保持与现有 TIRx lowering pipeline、script builder、printer 和测试风格一致。
+### 2.1 Graph Function
 
-## 2. 用户层 API
+`graph_func` 描述完整 megakernel 的 tile-level dataflow graph。它不是普通逐 op
+host launch graph，而是一个待 lowering 的设备端 persistent kernel 模板。
 
-### 2.1 Event Tensor API
+在 TIRx 中，`graph_func` lowering 为一个 `@T.prim_func`：
 
-新增 TIRx script builder API，挂在 `tvm.script.tirx as T` 下：
+- 函数参数是 input/output tensor 以及必要的 workspace。
+- 函数体包含 `T.device_entry()`。
+- kernel 内部创建 Event Tensor、task queue、intermediate tensor。
+- kernel 内部执行 persistent loop，并 dispatch 到不同 tile task。
+
+### 2.2 Device Function
+
+`device_func` 表示 tile task body。每个 task 由 task coordinate 标识，例如
+`partial_sum(i, j)` 或 `final_sum(i)`。task body 可以用三种方式在 TIRx 中表达：
+
+- `T.inline` helper：适合第一版 raw sum demo。
+- private TIRx PrimFunc：适合较复杂 tile primitive，lowering 前 inline 到 fused kernel。
+- dispatch 分支内直接写 task body：适合生成代码最简单的原型。
+
+第一版推荐使用 `T.inline` 或 dispatch 分支内代码，避免新增独立 device function 调用约定。
+
+### 2.3 Call Device
+
+`call_device(fn, tile_num, args, in_edges, out_edges)` 表示创建一组 tile tasks。
+
+Lowering 时为每个 `call_device` 分配一个 `task_type`，并记录：
+
+- `tile_num`：task grid shape。
+- `fn`：task body。
+- `in_edges`：task 执行前需要等待的 Event Tensor。
+- `out_edges`：task 完成后需要通知的 Event Tensor。
+- coordinate mapping：从 task coordinate 到 event coordinate 的映射。
+
+例如：
 
 ```python
-E = T.event_tensor(shape, init, dtype="int32", scope="global", name="row_done")
+out_edges={E: "ij->i"}
+in_edges={E: "i->i"}
+```
+
+表示 `partial_sum(i, j)` 完成后通知 `E[i]`，`final_sum(i)` 执行前等待 `E[i]`。
+
+## 3. Event Tensor 语义
+
+Event Tensor 是多维 `int32` counter tensor。每个元素代表一个事件，事件的 counter
+记录该事件还需要等待多少 producer task 完成。
+
+### 3.1 API
+
+TIRx script 暴露以下 API：
+
+```python
+E = T.event_tensor(
+    shape,
+    wait_count,
+    dtype="int32",
+    scope="global",
+    name=None,
+)
+
 T.event_init(E)
 T.event_reset(E, indices, value)
-T.event_wait(E, indices)
-is_last = T.event_notify(E, indices)
+T.event_wait(E, indices, backoff=0)
+is_triggered = T.event_notify(E, indices)
 ```
 
-语义：
+语义如下：
 
-- `T.event_tensor(shape, init, ...)` 声明一个事件计数器 tensor。
-- `shape` 是 event space 的形状，允许 `PrimExpr`。
-- `init` 是默认初始计数，允许常量或 `PrimExpr`。
-- `scope` 第一版只支持 `"global"`，因为跨 SM 依赖需要全局可见。
-- `T.event_init(E)` 按 `init` 初始化整个 Event Tensor。
-- `T.event_reset(E, idx, value)` 写入计数器，主要用于 kernel prologue 初始化。
-- `T.event_wait(E, idx)` 等待 `E[idx] == 0`。
-- `T.event_notify(E, idx)` 对 `E[idx]` 做 atomic decrement，并返回 decrement 后是否为
-  0。返回 `True` 的执行者是最后一个 producer，可用于 dynamic schedule 触发后继 task。
+- `T.event_tensor` 声明一个 Event Tensor handle。
+- `shape` 是 event space shape，允许包含 symbolic shape。
+- `wait_count` 是默认初始 counter，可以是常量或 `PrimExpr`。
+- `T.event_init(E)` 初始化所有 event 元素为默认 `wait_count`。
+- `T.event_reset(E, indices, value)` 设置单个 event counter，用于 data-dependent wait count。
+- `T.event_wait(E, indices)` 等待目标 counter 到 0。
+- `T.event_notify(E, indices)` 对目标 counter 做 atomic decrement，并返回是否触发事件。
 
-第一版约束：
+`event_notify` 的返回值定义为 `old_value == 1`。返回 true 的 task 是最后一个 producer，
+dynamic schedule 可用它 push 后继 consumer tasks。
 
-- Event Tensor 元素类型固定为 `int32`。
-- 不支持同一 kernel 内多轮 reset/reuse 一个 event 元素。
-- `wait` 和 `notify` 的索引必须与 `shape` 维度一致。
-- event storage 默认由 lowering pass 生成，不作为用户可见普通 buffer 参数。
+### 3.2 存储位置
 
-### 2.2 Inline Task 写法
+正式语义要求 Event Tensor 存放在 global memory。
 
-不新增 `@mk.device_func`。task body 使用现有 `T.inline` 或直接写在 dispatch 分支里：
+原因：
 
-```python
-@T.inline
-def partial_sum(A, P, m_tile: T.int32, k_part: T.int32):
-    ...
+- Event Tensor 的目标是表达跨 CTA/SM 的 tile task 依赖。
+- static schedule 中一个 SM 的 consumer 可能等待另一个 SM 的 producer。
+- dynamic schedule 中任意 SM 都可能 notify 或消费同一个 event。
+- shared memory 只在单 CTA 内可见，不能作为跨 SM 依赖的正确实现。
 
+因此第一版正式 lowering 使用 global backing buffer：
 
-@T.inline
-def final_sum(P, Y, m_tile: T.int32):
-    ...
+```text
+int32 event_storage[num_events]
 ```
 
-如果 task 很复杂，也可以保留为 private `PrimFunc`，后续通过现有 private function
-inline pass 或普通 call lowering 处理。Event Tensor 设计本身不规定 task 表达方式。
+多维 event index flatten 到线性 index：
 
-### 2.3 Dynamic Queue API
+```text
+flat = (((i0 * shape1) + i1) * shape2 + i2) ...
+```
 
-dynamic schedule 第一版可以有两种实现方式：
+当前已有 TIRx prototype 可以用 shared memory 支撑 single-CTA demo，但文档和最终实现
+不把 shared memory 作为 Event Tensor 的语义存储。shared memory 只能作为局部优化，例如
+同 CTA 内 event 或 global counter 的 cache，但必须保持 global 语义等价。
 
-- 最小实现：用户直接用普通 `T.alloc_buffer`、`T.cuda.atomic_add`、`T.ptx.atom_scalar`
-  等写 queue。
-- 便利实现：新增少量 `T.ready_queue`、`T.queue_push`、`T.queue_pop` helper。
+### 3.3 同步方式
 
-建议第一版先做便利 API，但将其定义为普通 TIRx 内建 op，而不是 graph-level API：
+Event Tensor 同步需要满足 producer 写入对 consumer 可见：
+
+- producer task 先写普通 tensor/intermediate buffer。
+- producer task 执行 `event_notify`。
+- consumer task 的 `event_wait` 返回后才能读 producer 输出。
+
+Lowering 约定：
+
+- `event_notify` 使用 release 语义的 atomic decrement。
+- `event_wait` 使用 acquire 语义 load 轮询 counter。
+- counter 到 0 后，consumer 可见 producer 在 notify 前完成的写入。
+
+CUDA lowering 形态：
+
+```text
+old = atomic_add_release(event_ptr, -1)
+is_triggered = (old == 1)
+
+while load_acquire(event_ptr) != 0:
+    optional_backoff()
+```
+
+`event_reset` 和 `event_init` 必须发生在任何相关 producer/consumer task 访问 event
+之前。多 CTA 初始化时需要使用单 CTA 初始化加发布标志，或由 host/workspace 初始化完成后
+再 launch megakernel。第一版建议在 kernel prologue 中由单 CTA 初始化，并通过 global
+start flag 让其他 CTA 等待初始化完成。
+
+## 4. Ready Queue 语义
+
+Dynamic schedule 需要 GPU 端 ready queue。TIRx script 暴露以下 API：
 
 ```python
-Q = T.ready_queue(capacity, task_fields=3, scope="global")
-T.queue_push(Q, op_id, coord0, coord1)
-ok, op_id, coord0, coord1 = T.queue_pop(Q)
+Q = T.ready_queue(capacity, task_fields, scope="global")
+T.queue_push(Q, task_type, *coords)
+ok, task_type, *coords = T.queue_pop(Q)
 live = T.queue_live(Q)
 T.queue_finish(Q)
 ```
 
-这些 API 只负责队列 lowering，不负责推导 task graph。
+第一版 queue descriptor 全部为 `int32`：
 
-## 3. PrimFunc 代码形态
-
-### 3.1 Static Schedule
-
-static schedule 完全写在 `PrimFunc` 的 device region 中。schedule table 可以是：
-
-- 编译期生成的 constant buffer。
-- host 侧作为参数传入的 buffer。
-- demo 第一版中直接用 loop 计算 `op_id/m/k`，避免额外常量表。
-
-代码形态：
-
-```python
-@T.prim_func
-def row_sum_static(A: T.Buffer((M, N), "float32"), Y: T.Buffer((M,), "float32")):
-    T.device_entry()
-    sm = T.cta_id([SM_COUNT])
-    tx = T.thread_id([NUM_THREADS])
-
-    E = T.event_tensor((M_TILES,), init=K_PARTS, name="row_done")
-    P = T.alloc_buffer((M_TILES, K_PARTS), "float32", scope="global")
-
-    T.event_init(E)
-
-    for slot in T.serial(tasks_per_sm):
-        op_id = ...
-        m_tile = ...
-        k_part = ...
-        if op_id == PARTIAL:
-            partial_sum(A, P, m_tile, k_part)
-            T.event_notify(E, m_tile)
-        else:
-            T.event_wait(E, m_tile)
-            final_sum(P, Y, m_tile)
+```text
+storage[capacity, task_fields]
+head
+tail
+pending_tasks
 ```
 
-`T.event_init(E)` 是 script 便利函数，可 lowering 成对所有 event 元素写入 `init`。也可
-由 `T.event_tensor` 在 lowering 时自动插入初始化；第一版建议显式调用，避免隐藏
-控制流和初始化位置。
+语义：
 
-### 3.2 Dynamic Schedule
+- `queue_push` 写入 task descriptor，并增加 `pending_tasks`。
+- `queue_pop` 从 queue 中取一个 task descriptor，成功时返回 `ok=True`。
+- `queue_finish` 在 task body 和所有后继 push 完成后减少 `pending_tasks`。
+- `queue_live` 返回未完成 task 数，persistent loop 使用 `queue_live(Q) > 0` 判断退出。
 
-dynamic schedule 也写在 `PrimFunc` 中。Event Tensor 只提供最后 producer 判定，是否
-push 后继 task 由用户代码决定：
+第一版使用 centralized global queue，优点是实现简单，缺点是高并发下 head/tail 原子操作
+可能有竞争。后续可优化为 per-SM queue、work stealing、分片 queue，但不改变 API。
+
+## 5. Static Schedule Lowering
+
+Static schedule 在编译期或 host 侧预先生成每个 SM 的 task queue。每个 CTA/SM 在
+megakernel 内执行自己的 persistent loop。
+
+### 5.1 Lowering 输入
+
+输入是 tile-level graph：
+
+```text
+TaskGrid {
+  task_type
+  tile_num
+  device_func
+  in_edges
+  out_edges
+}
+```
+
+每条 edge 包含：
+
+```text
+event tensor
+producer/consumer task type
+coordinate map
+```
+
+### 5.2 Static Task Queue
+
+生成：
+
+```text
+static_tasks[num_tasks] = {
+  task_type,
+  coord_offset,
+}
+
+static_coords[num_coords]
+
+static_queues[sm_count] = {
+  begin,
+  end,
+}
+```
+
+最简单策略是按 logical schedule round-robin 分配给 SM。后续可以使用 cost model 或
+polyhedral schedule 优化分配。
+
+### 5.3 Kernel 形态
 
 ```python
 @T.prim_func
-def row_sum_dynamic(A: T.Buffer((M, N), "float32"), Y: T.Buffer((M,), "float32")):
+def megakernel(A, C, workspace):
     T.device_entry()
     sm = T.cta_id([SM_COUNT])
-    tx = T.thread_id([NUM_THREADS])
+    tx = T.thread_id([THREADS])
 
-    E = T.event_tensor((M_TILES,), init=K_PARTS, name="row_done")
-    P = T.alloc_buffer((M_TILES, K_PARTS), "float32", scope="global")
-    Q = T.ready_queue(capacity=M_TILES * K_PARTS + M_TILES, task_fields=3)
-
+    E = T.event_tensor((...), wait_count=...)
     T.event_init(E)
+    T.grid_init_barrier()
+
+    task_pos = static_queues[sm].begin
+    while task_pos < static_queues[sm].end:
+        task_type, coords = load_static_task(task_pos)
+
+        if task_type == PARTIAL:
+            partial_sum(coords...)
+            T.event_notify(E, event_index_from_partial(coords))
+
+        elif task_type == FINAL:
+            T.event_wait(E, event_index_from_final(coords))
+            final_sum(coords...)
+
+        task_pos += 1
+```
+
+实际 pass 应按统一规则插入 wait/notify：
+
+- 对 `in_edges`：task body 前插入 `event_wait`。
+- 对 `out_edges`：task body 后插入 `event_notify`。
+
+static schedule 的特点：
+
+- 调度开销低。
+- 适合 regular workload。
+- 如果 consumer 被排到较早位置，可能 spin wait；但其他 SM 仍可继续执行自己的 queue。
+- 对 data-dependent workload 只能保守化处理，或改用 dynamic schedule。
+
+## 6. Dynamic Schedule Lowering
+
+Dynamic schedule 不预先固定每个 SM 的完整任务序列，而是在 GPU 端根据 ready queue 动态取任务。
+
+### 6.1 基本策略
+
+- 初始化 source tasks 到 ready queue。
+- 每个 CTA/SM 在 persistent loop 中 pop task。
+- task 执行完后 notify out events。
+- 当 event counter 到 0 时，push 对应 consumer tasks。
+- `pending_tasks` 到 0 后所有 CTA/SM 退出。
+
+### 6.2 Kernel 形态
+
+```python
+@T.prim_func
+def megakernel_dynamic(A, C, workspace):
+    T.device_entry()
+    sm = T.cta_id([SM_COUNT])
+    tx = T.thread_id([THREADS])
+
+    E = T.event_tensor((...), wait_count=...)
+    Q = T.ready_queue(capacity=..., task_fields=...)
+
     if sm == 0 and tx == 0:
-        for m in T.serial(M_TILES):
-            for k in T.serial(K_PARTS):
-                T.queue_push(Q, PARTIAL, m, k)
+        T.event_init(E)
+        for each source task:
+            T.queue_push(Q, task_type, coords...)
+        T.publish_init_done()
+
+    T.wait_init_done()
 
     while T.queue_live(Q) > 0:
-        ok, op_id, m_tile, k_part = T.queue_pop(Q)
+        ok, task_type, coords = T.queue_pop(Q)
         if ok:
-            if op_id == PARTIAL:
-                partial_sum(A, P, m_tile, k_part)
-                if T.event_notify(E, m_tile):
-                    T.queue_push(Q, FINAL, m_tile, 0)
+            if task_type == PARTIAL:
+                partial_sum(coords...)
+                if T.event_notify(E, event_index_from_partial(coords)):
+                    T.queue_push(Q, FINAL, consumer_coords...)
                 T.queue_finish(Q)
-            else:
-                final_sum(P, Y, m_tile)
+
+            elif task_type == FINAL:
+                final_sum(coords...)
                 T.queue_finish(Q)
 ```
 
-实际实现中 `queue_live` 和 `queue_finish` 的精确定义需要避免 race。推荐语义：
+Dynamic schedule 中 consumer task 是由最后一个 producer 的 notify 触发入队，因此正常情况
+下 consumer task body 前不需要再次 wait。为了支持 early-push 优化，可以允许 consumer
+提前入队，但这种模式必须在 consumer body 前保留 `event_wait`。
 
-- 每个 `queue_push` 增加 `pending_tasks`。
-- 每个成功 pop 不改变 `pending_tasks`。
-- task 完成后调用 `queue_finish` 减少 `pending_tasks`。
-- loop 条件读取 `pending_tasks > 0`。
+### 6.3 Early Push 优化
 
-source task 初始化完成后需要一个 device-wide 可见的同步点。第一版可要求只用单 CTA
-初始化并通过 global flag + acquire/release 让其他 CTA 等待，而不是依赖 CUDA grid
-barrier。
+论文中的 early-push 策略用于隐藏 scheduler push 开销：
 
-## 4. IR 和 Lowering
+- 不等 producer task 完成后才 push consumer。
+- 当所有 producer task 已经 dispatch 到 SM 后，可以提前 push consumer。
+- consumer 执行前仍然执行 `event_wait`，保证数据依赖正确。
 
-### 4.1 新增 IR 节点
-
-新增的 IR 应是 TIRx statement/expression 级别，而不是 graph-level function：
-
-- `EventTensorNode`
-  - 描述 event handle，字段包括 `shape`、`init`、`dtype`、`scope`、`name`。
-  - Python 侧对象表现类似 Buffer handle，但只允许 event op 使用。
-- `EventInitStmt`
-  - 初始化整个 event tensor。
-- `EventResetStmt`
-  - 初始化单个 event 元素。
-- `EventWaitStmt`
-  - 等待单个 event 元素为 0。
-- `EventNotify`
-  - 表达式，返回 `bool`，表示当前 notify 是否将计数器减到 0。
-
-如果为了少增节点，也可以将 `event_init/reset/wait/notify` 先实现为 `tirx.Call` 到
-builtin op，再由 `LowerEventTensor` 识别。长期看，独立节点更利于 verifier、printer
-和结构相等测试。
-
-### 4.2 LowerEventTensor Pass
-
-新增 `tirx.transform.LowerEventTensor()`，插入在 `LowerTIRx` 之前或作为
-`LowerTIRx` 早期子步骤。职责：
-
-- 为每个 `EventTensor` 分配 backing buffer：
-  - `int32[event_numel]`。
-  - 第一版使用 global workspace。
-- 将多维 event index flatten 成线性 index。
-- `EventInitStmt` lowering：
-  - 生成初始化 loop。
-  - 对 dynamic schedule 的 cross-CTA start flag 插入必要 acquire/release。
-- `EventResetStmt` lowering：
-  - `event_buf[flat_idx] = value`。
-- `EventWaitStmt` lowering：
-  - 生成 `while T.ptx.ld_acquire(event_buf + idx) != 0: pass`。
-  - 后续可加入 backoff。
-- `EventNotify` lowering：
-  - 生成 atomic decrement。
-  - 返回 `old_value == 1`。
-  - 使用 release 语义保证 producer 写入对 consumer 可见。
-
-### 4.3 Queue Lowering
-
-若实现便利 queue API，新增 `LowerReadyQueue()`：
-
-- `T.ready_queue(capacity, task_fields)` 分配：
-  - `queue_storage[capacity, task_fields]`
-  - `head`
-  - `tail`
-  - `pending_tasks`
-- `queue_push`：
-  - atomic add tail，写 task descriptor，再 release 增加 `pending_tasks`。
-- `queue_pop`：
-  - atomic add head 获取 slot。
-  - 若 head 超过当前 tail，返回 `ok=False` 或回退重试。
-- `queue_finish`：
-  - release decrement `pending_tasks`。
-
-第一版可以限制 queue capacity 静态可知，并在 verifier 中要求所有 fields 为 `int32`。
-
-### 4.4 Verifier
-
-新增 verifier 检查：
-
-- `event_wait/notify/reset` 的 index 维度匹配 event shape。
-- Event Tensor 只能在 `T.device_entry()` device region 中使用。
-- `scope` 第一版只能是 `"global"`。
-- `EventNotify` 的返回值只能作为 `PrimExpr(bool)` 使用，不能被 store 成非 bool。
-- dynamic queue API 只能在 device region 中使用。
-- `ready_queue` 的 task field 数和 `queue_push/pop` 参数个数一致。
-
-## 5. Row/Raw Sum Demo
-
-目标计算：
+第一版实现可不启用 early-push。文档和接口要预留该模式：
 
 ```text
-Y[m] = sum_n A[m, n]
+trigger policy:
+  complete_push: notify counter 到 0 时 push
+  early_push: producer dispatch counter 到 0 时 push，consumer 执行前 wait
 ```
 
-任务划分：
+## 7. Raw Sum 示例
 
-- `partial_sum(m_tile, k_part)` 计算一段 K/N 维度上的 partial sum，写入
-  `P[m_tile, k_part]`。
-- `final_sum(m_tile)` 等待该 row tile 的所有 partial 完成，读取 `P[m_tile, :]` 并写
-  `Y[m_tile]`。
+任务文件中的 graph：
 
-Event Tensor：
+```python
+class IRModule:
+    @device_func
+    def partial_sum(i: int, j: int, A: Tensor, B: Tensor):
+        B[i*32: i*32 + 32, j] = sum(A[i*32: i*32 + 32, j*32:j*32+32])
+
+    @device_func
+    def final_sum(i: int, B: Tensor, C: Tensor):
+        C[i*32: i*32+32] = sum(B[i*32: i*32+32, :])
+
+    @graph_func
+    def main_graph(A: Tensor(("n*32", 128))) -> Tensor(("n*32",)):
+        n = sym_var()
+        E = ETensor((n,), wait_count=4)
+        B = call_device(
+            IRModule.partial_sum,
+            tile_num=(n, 4),
+            args=[A],
+            in_edge={},
+            out_edges={E: "ij->i"},
+        )
+        C = call_device(
+            IRModule.final_sum,
+            tile_num=(n,),
+            args=[B],
+            in_edges={E: "i->i"},
+            out_edges={},
+        )
+        return C
+```
+
+### 7.1 Event Tensor
 
 ```text
-E.shape = (M_TILES,)
-E.init = K_PARTS
+E.shape = (n,)
+E.wait_count = 4
 ```
 
-依赖逻辑在 PrimFunc 中显式表达：
+每个 `E[i]` 等待四个 producer：
+
+```text
+partial_sum(i, 0)
+partial_sum(i, 1)
+partial_sum(i, 2)
+partial_sum(i, 3)
+```
+
+当四个 producer 都完成后，`final_sum(i)` 可以执行。
+
+### 7.2 Intermediate Tensor
+
+`B` 是跨 task intermediate tensor：
+
+```text
+B.shape = (n * 32, 4)
+```
+
+正式实现中 `B` 需要 global/workspace allocation，因为 `partial_sum` 和 `final_sum` 可在
+不同 CTA/SM 上执行。single-CTA demo 可以把 `B` 放 shared memory，但这不是通用语义。
+
+### 7.3 Static Lowering 伪代码
 
 ```python
-partial_sum(A, P, m, k)
-if T.event_notify(E, m):
-    # dynamic schedule: last producer releases final_sum
-    T.queue_push(Q, FINAL, m, 0)
+@T.prim_func
+def raw_sum_static(A, C, workspace):
+    T.device_entry()
+    sm = T.cta_id([SM_COUNT])
+    tx = T.thread_id([THREADS])
+
+    E = T.event_tensor((n,), wait_count=4)
+    B = T.alloc_buffer((n * 32, 4), "float32", scope="global")
+
+    T.event_init(E)
+    T.grid_init_barrier()
+
+    while static_scheduler_valid(sm):
+        task_type, i, j = static_scheduler_get(sm)
+
+        if task_type == PARTIAL:
+            partial_sum(i, j, A, B)
+            T.event_notify(E, i)
+
+        elif task_type == FINAL:
+            T.event_wait(E, i)
+            final_sum(i, B, C)
+
+        static_scheduler_next(sm)
 ```
 
-static schedule 中 final task 显式等待：
+### 7.4 Dynamic Lowering 伪代码
 
 ```python
-T.event_wait(E, m)
-final_sum(P, Y, m)
+@T.prim_func
+def raw_sum_dynamic(A, C, workspace):
+    T.device_entry()
+    sm = T.cta_id([SM_COUNT])
+    tx = T.thread_id([THREADS])
+
+    E = T.event_tensor((n,), wait_count=4)
+    B = T.alloc_buffer((n * 32, 4), "float32", scope="global")
+    Q = T.ready_queue(capacity=n * 5, task_fields=3)
+
+    if sm == 0 and tx == 0:
+        T.event_init(E)
+        for i in T.serial(n):
+            for j in T.serial(4):
+                T.queue_push(Q, PARTIAL, i, j)
+        T.publish_init_done()
+
+    T.wait_init_done()
+
+    while T.queue_live(Q) > 0:
+        ok, task_type, i, j = T.queue_pop(Q)
+        if ok:
+            if task_type == PARTIAL:
+                partial_sum(i, j, A, B)
+                if T.event_notify(E, i):
+                    T.queue_push(Q, FINAL, i, 0)
+                T.queue_finish(Q)
+
+            elif task_type == FINAL:
+                final_sum(i, B, C)
+                T.queue_finish(Q)
 ```
 
-dynamic schedule 中 final task 只由最后一个 notify push，因此可以不再 wait；为了调试
-和稳健性，也可保留 `T.event_wait(E, m)`，但第一版建议不保留，避免重复 spin。
+## 8. TIRx 实现路线
 
-## 6. 测试和验收标准
+### 8.1 前端表示
 
-### 6.1 IR 和 Script 测试
+新增或规范化以下 Python-side object：
 
-新增测试：
+```text
+EventTensor {
+  shape
+  wait_count
+  dtype
+  scope
+  name
+  backing_buffer
+}
 
-- `tests/python/tirx/test_event_tensor.py`
-  - 构造 `T.event_tensor`、`T.event_init`、`T.event_wait`、`T.event_notify`。
-  - 检查 parser/printer roundtrip。
-  - 检查结构相等和 script 输出。
-- `tests/python/tirx/test_ready_queue.py`
-  - 构造 `T.ready_queue`、`T.queue_push`、`T.queue_pop`。
-  - 检查 task field 数不匹配时报错。
+ReadyQueue {
+  capacity
+  task_fields
+  scope
+  storage
+  head
+  tail
+  pending_tasks
+}
+```
 
-### 6.2 Lowering 测试
+第一版可以把 Event Tensor 和 ReadyQueue 表达为带 annotation 的 `Buffer`，由 lowering pass
+识别。长期更合适的方式是独立 TIRx IR node，因为 verifier、printer、结构相等和错误诊断
+会更清晰。
 
-新增 transform 测试：
+### 8.2 LowerEventTensor
 
-- `tests/python/tirx/transform/test_lower_event_tensor.py`
-  - `event_init` lowering 到 `int32` buffer 初始化 loop。
-  - `event_wait` lowering 到 acquire load + while。
-  - `event_notify` lowering 到 atomic decrement，并返回 `old == 1`。
-- `tests/python/tirx/transform/test_lower_ready_queue.py`
-  - queue storage、head/tail/pending allocation。
-  - push/pop/finish lowering 到 atomic 和 buffer access。
+新增 `tirx.transform.LowerEventTensor()`：
 
-### 6.3 Demo 和 Runtime 测试
+- 为每个 Event Tensor 创建 global `int32` backing buffer。
+- 处理 symbolic shape 的 numel 计算。
+- flatten 多维 event index。
+- lowering `event_init` 到初始化 loop。
+- lowering `event_reset` 到 counter store。
+- lowering `event_wait` 到 acquire load spin loop。
+- lowering `event_notify` 到 release atomic decrement 和 `old == 1`。
 
-新增 row/raw sum demo：
+### 8.3 LowerReadyQueue
 
-- static 版本：`tests/python/tirx/test_event_tensor_row_sum_static.py`
-- dynamic 版本：`tests/python/tirx/test_event_tensor_row_sum_dynamic.py`
+新增 `tirx.transform.LowerReadyQueue()`：
 
-验证：
+- 创建 global queue storage、head、tail、pending。
+- lowering `queue_push` 到 tail atomic reserve、descriptor store、pending increment。
+- lowering `queue_pop` 到 head atomic reserve 和 bounds check。
+- lowering `queue_finish` 到 pending decrement。
+- lowering `queue_live` 到 acquire load pending。
 
+### 8.4 Graph-to-Megakernel Pass
+
+新增 graph-level transformation，输入是显式 Event Tensor graph：
+
+```text
+LowerEventTensorGraph(schedule="static" | "dynamic")
+```
+
+static 模式：
+
+- 枚举所有 task instances。
+- 生成 static task queue。
+- 生成 dispatch loop。
+- 插入 wait/body/notify。
+
+dynamic 模式：
+
+- 生成 source task 初始化逻辑。
+- 生成 ready queue persistent loop。
+- 在 notify trigger 处插入后继 task push。
+- 支持 complete-push，预留 early-push。
+
+## 9. 校验和错误处理
+
+Verifier 应检查：
+
+- Event Tensor dtype 必须是 `int32`。
+- Event Tensor 正式 scope 必须是 `global`。
+- `event_wait/notify/reset` 的 indices 数量必须等于 event rank。
+- `wait_count` 非负。
+- 每个 event 的 `wait_count` 与 producer 数一致，除非用户显式标记为 runtime init。
+- dynamic queue 的 `task_fields` 与 push/pop 解包数量一致。
+- `queue_finish` 必须在成功 pop 的 task 路径上执行。
+- dynamic schedule 的 queue capacity 必须能容纳最坏情况下的 live task，或插入 overflow assert。
+- 跨 task intermediate tensor 不能放在 shared memory，除非证明所有 producer/consumer 在同一 CTA。
+
+## 10. 测试计划
+
+### 10.1 Script 和 IR 测试
+
+- 构造 `T.event_tensor`、`T.event_init`、`T.event_wait`、`T.event_notify`。
+- 检查 index rank mismatch 报错。
+- 检查 dtype/scope 限制报错。
+- 检查 `T.ready_queue` 的 field 数校验。
+- 检查 script printer roundtrip。
+
+### 10.2 Lowering 测试
+
+- `event_init` lowering 为 global counter 初始化。
+- `event_notify` lowering 为 release atomic decrement。
+- `event_wait` lowering 为 acquire load spin wait。
+- `queue_push/pop/finish/live` lowering 为 global queue 操作。
+- dynamic complete-push 中只有最后一个 producer push consumer。
+
+### 10.3 Raw Sum 运行测试
+
+新增或完善：
+
+```text
+docs/megakernel/examples/raw_sum_event_tensor.py
+tests/python/tirx/test_event_tensor_raw_sum.py
+```
+
+测试场景：
+
+- static schedule raw sum。
+- dynamic schedule raw sum。
+- `n=1`、`n=8`、非整除边界形状。
 - 对比 NumPy `A.sum(axis=1)`。
-- 覆盖整除和非整除形状：
-  - `M=128, N=1024, K_PARTS=4`
-  - `M=257, N=1000, K_PARTS=8`
-- 对 dynamic 版本检查 final task 数等于 `M_TILES`，避免重复 push。
+- dynamic 下检查每个 `final_sum(i)` 只执行一次。
 
-最小命令：
+### 10.4 环境说明
+
+当前本地 TIRx CUDA 测试需要 sm_100a。若机器不具备该硬件，相关测试会 skip。最终验收应在
+sm_100a CUDA 环境运行：
 
 ```bash
 export PYTHONPATH="$(pwd)/python:$(pwd)/.local/python"
-python -m pytest tests/python/tirx/test_event_tensor.py -xvs
-python -m pytest tests/python/tirx/transform/test_lower_event_tensor.py -xvs
+python -m pytest tests/python/tirx/test_event_tensor.py -q -rs
+python -m pytest tests/python/tirx-base/test_event_tensor_megakernel.py -q -rs
+python docs/megakernel/examples/raw_sum_event_tensor.py
 ```
 
-若修改 C++ IR 或 codegen，需要运行：
+## 11. 分阶段交付
 
-```bash
-cmake --build build --parallel
-python -m pytest tests/python/tirx/transform/ -xvs
-```
+第一阶段：Event Tensor 最小闭环
 
-## 7. 分阶段实现
+- 支持 global Event Tensor backing buffer。
+- 支持 init/reset/wait/notify。
+- 支持 static raw sum。
+- 完成 lowering 和基础 verifier。
 
-### 阶段 1：Event Tensor 最小闭环
+第二阶段：Dynamic Ready Queue
 
-- 新增 Event Tensor script API 和 IR 表达。
-- 实现 `LowerEventTensor`。
-- 实现 static row/raw sum demo。
-- 不实现 ready queue helper，dynamic schedule 可先手写 queue buffer。
+- 支持 global ready queue。
+- 支持 complete-push dynamic schedule。
+- 支持 dynamic raw sum。
+- 增加 queue overflow/assert 和 pending liveness 校验。
 
-### 阶段 2：Ready Queue Helper
+第三阶段：Graph-to-Megakernel 自动化
 
-- 新增 `T.ready_queue`、`T.queue_push`、`T.queue_pop`、`T.queue_finish`。
-- 实现 `LowerReadyQueue`。
-- 实现 dynamic row/raw sum demo。
+- 支持从 `graph_func`/`device_func`/`call_device` 表示生成 TIRx megakernel。
+- 支持 einsum-like coordinate mapping。
+- 支持 symbolic shape。
+- 支持 data-dependent event reset 和 task triggering。
 
-### 阶段 3：工程化和性能
+第四阶段：性能优化
 
-- 增加 backoff、acquire/release 语义选择、queue capacity 检查。
-- 支持 per-SM queue 或分片 queue。
-- 支持 event storage 与 workspace memory planner 结合。
-- 增加复杂 megakernel demo，例如 MoE-like dispatch。
+- early-push。
+- per-SM queue / work stealing。
+- backoff 策略。
+- event storage 分片。
+- shared-memory cache 或 warp-level cooperative wait/notify。
 
-## 8. 开放问题和默认选择
+## 12. 设计结论
 
-- Event Tensor 是否作为独立 IR 节点还是 builtin call：第一版建议独立节点，调试和验证更清楚。
-- `T.event_tensor` 是否自动初始化：第一版要求显式 `T.event_init(E)`。
-- dynamic queue 是否必须作为 API：第一阶段不必须，第二阶段作为便利 helper。
-- static schedule 是否由 pass 自动生成：第一版不做，用户在 `PrimFunc` 中显式写 schedule
-  loop；后续可以新增优化 pass 生成 schedule table。
-- `P` 这样的跨 task 中间 buffer 不需要 `mk.workspace`，直接用现有 buffer/alloc 表达；
-  如果 global-scope `AllocBuffer` 的 lowering 不满足需求，再扩展现有 buffer allocation，
-  不新增 megakernel workspace API。
+Event Tensor 在 TIRx 中应作为一等依赖同步抽象，而不是普通 host-side task graph。核心实现是
+把 event 元素 lowering 为 global `int32` counter，并用 release atomic decrement 与 acquire
+spin wait 表达 producer-consumer 依赖。static schedule 通过预计算 per-SM queue 最小化调度
+开销；dynamic schedule 通过 GPU ready queue 在运行时触发后继 task，支持 shape 和
+data-dependent dynamism。
 
-第一版默认：纯 `PrimFunc` 承载；只新增 Event Tensor 语义；queue helper 延后；row/raw
-sum 先跑 static schedule，再补 dynamic schedule。
+对 `fake_example.py` 的 raw sum，`partial_sum(i, j)` 到 `final_sum(i)` 的依赖可完整表达为
+`E[i]` 的 wait-count counter：四个 partial task 分别 notify，同一个 row 的 final task 在
+counter 到 0 后执行。该设计能覆盖任务要求的 static 和 dynamic 两种 megakernel 编译运行路径。
