@@ -197,7 +197,7 @@ def _validate_graph(graph: EventTensorGraph) -> ETensor:
 def lower_event_tensor_graph(
     graph: EventTensorGraph,
     *,
-    n_tiles: int,
+    n_tiles: int, # 4
     schedule: str,
     row_tile: int = 32,
     n_cols: int = 128,
@@ -208,8 +208,8 @@ def lower_event_tensor_graph(
     """Lower a supported Event Tensor graph to a TIRx PrimFunc."""
 
     event = _validate_graph(graph)
-    k_parts = int(event.wait_count)
-    rows = n_tiles * row_tile
+    k_parts = int(event.wait_count) # 4
+    rows = n_tiles * row_tile # 128
     if n_cols % k_parts != 0:
         raise ValueError("lowering requires n_cols divisible by wait_count")
     if queue_policy != "centralized":
@@ -224,18 +224,18 @@ def lower_event_tensor_graph(
 
 
 def _lower_static(
-    n_tiles: int,
-    rows: int,
-    row_tile: int,
-    n_cols: int,
-    k_parts: int,
-    wait_backoff: int,
+    n_tiles: int, # 4
+    rows: int, # 128
+    row_tile: int, # 32
+    n_cols: int, # 128
+    k_parts: int,# 4
+    wait_backoff: int, # 0
 ):
-    part_cols = n_cols // k_parts
-    workers = min(4, max(1, n_tiles * (k_parts + 1)))
-    threads = max(32, row_tile)
-    tasks_per_tile = k_parts + 1
-    task_count = n_tiles * tasks_per_tile
+    part_cols = n_cols // k_parts # 4
+    workers = min(4, max(1, n_tiles * (k_parts + 1))) # 4
+    threads = max(32, row_tile) # 32
+    tasks_per_tile = k_parts + 1 # 5
+    task_count = n_tiles * tasks_per_tile # 20
 
     @T.prim_func
     def static_kernel(
@@ -245,8 +245,8 @@ def _lower_static(
         P: T.Buffer((rows, k_parts), "float32"),
     ):
         T.device_entry()
-        worker = T.cta_id([workers])
-        tx = T.thread_id([threads])
+        worker = T.cta_id([workers]) # 4个cta，worker是cta id
+        tx = T.thread_id([threads]) # 每个cta 32个thread，tx是thread id
         E = T.event_tensor((n_tiles,), wait_count=k_parts, storage=E_buf, name="row_done")
         for task in T.serial(worker, task_count, step=workers):
             i = task // tasks_per_tile
