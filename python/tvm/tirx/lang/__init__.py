@@ -16,21 +16,43 @@
 # under the License.
 
 from .megakernel import (
+    EdgeMap,
     ETensor,
+    EventPlan,
+    EventSpec,
+    EventView,
+    GraphMetadata,
+    RuntimeResourcePlan,
+    StaticSchedulePlan,
+    TaskSpec,
     Tensor,
+    TensorSpec,
+    analyze_event_tensor_graph,
     call_device,
     device_func,
     graph_func,
     lower_event_tensor_graph,
+    plan_static_event_tensor_graph,
     sym_var,
 )
 
 __all__ = [
     "ETensor",
+    "EdgeMap",
+    "EventPlan",
+    "EventSpec",
+    "EventView",
+    "GraphMetadata",
+    "RuntimeResourcePlan",
+    "StaticSchedulePlan",
+    "TaskSpec",
     "Tensor",
+    "TensorSpec",
+    "analyze_event_tensor_graph",
     "call_device",
     "device_func",
     "graph_func",
     "lower_event_tensor_graph",
+    "plan_static_event_tensor_graph",
     "sym_var",
 ]

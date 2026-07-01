@@ -18,6 +18,22 @@ import importlib.util
 from pathlib import Path
 
 import tvm
+from tvm.script import tirx as T
+from tvm.tirx.lang import (
+    ETensor,
+    Tensor,
+    call_device,
+    device_func,
+    graph_func,
+    lower_event_tensor_graph,
+    sym_var,
+)
+from tvm.tirx.lang.megakernel import (
+    _analyze_graph,
+    _make_event_plan,
+    _make_static_schedule_plan,
+    _validate_static_raw_sum,
+)
 
 
 def _load_fake_example():
@@ -30,7 +46,9 @@ def _load_fake_example():
 
 def _cuda_source(func) -> str:
     mod = tvm.compile(
-        tvm.IRModule({"main": func}), target=tvm.target.Target("cuda"), tir_pipeline="tirx"
+        tvm.IRModule({"main": func}),
+        target=tvm.target.Target("cuda"),
+        tir_pipeline="tirx",
     )
     return mod.mod.imports[0].inspect_source()
 
@@ -38,9 +56,80 @@ def _cuda_source(func) -> str:
 def test_fake_example_traces_event_tensor_graph():
     fake = _load_fake_example()
     graph = fake.trace_graph()
-    assert [call.device_func.name for call in graph.calls] == ["partial_sum", "final_sum"]
+    assert [call.device_func.name for call in graph.calls] == [
+        "partial_sum",
+        "final_sum",
+    ]
     assert next(iter(graph.calls[0].out_edges.values())) == "ij->i"
     assert next(iter(graph.calls[1].in_edges.values())) == "i->i"
+
+
+def test_static_metadata_infers_wait_count_and_schedule():
+    fake = _load_fake_example()
+    metadata = _analyze_graph(fake.trace_graph())
+    event = _validate_static_raw_sum(metadata)
+    event_plan = _make_event_plan(event, {"n": 2})
+    schedule_plan = _make_static_schedule_plan(metadata, {"n": 2}, num_workers=2)
+
+    assert event_plan.shape == (2,)
+    assert event_plan.wait_count == 4
+    assert schedule_plan.task_record_layout == ("task_type", "linear_task_id")
+    assert schedule_plan.queue_offsets == (0, 5, 10)
+    assert schedule_plan.queue_tasks[0] == (0, 0)
+    assert schedule_plan.queue_tasks[2] == (1, 0)
+    assert schedule_plan.queue_tasks[-1] == (1, 1)
+
+
+class InlineRawSum:
+    @device_func
+    @T.inline
+    def partial_sum(i, j, A, B, tx):
+        if tx < 2:
+            row = i * 2 + tx
+            B[row, j] = A[row, j * 2] + A[row, j * 2 + 1]
+
+    @device_func
+    @T.inline
+    def final_sum(i, B, C, tx):
+        if tx < 2:
+            row = i * 2 + tx
+            C[row] = B[row, 0] + B[row, 1]
+
+    @graph_func
+    def main_graph(A: Tensor(("n*2", 4))) -> Tensor(("n*2",)):
+        n = sym_var()
+        E = ETensor((n,), name="row_done")
+        B = call_device(
+            InlineRawSum.partial_sum,
+            tile_num=(n, 2),
+            args=[A],
+            outputs=Tensor((n * 2, 2)),
+            out_edges={E: "ij->i"},
+        )
+        return call_device(
+            InlineRawSum.final_sum,
+            tile_num=(n,),
+            args=[B],
+            outputs=Tensor((n * 2,)),
+            in_edges={E: "i->i"},
+        )
+
+
+def test_static_lowering_accepts_inline_task_bodies():
+    graph = InlineRawSum.main_graph(Tensor(("n*2", 4)))
+    func = lower_event_tensor_graph(
+        graph,
+        n_tiles=2,
+        schedule="static",
+        row_tile=2,
+        n_cols=4,
+    )
+    script = func.script()
+
+    assert "T.ptx.atom_scalar" in script
+    assert "T.ptx.ld_acquire" in script
+    assert "A[row, phase * 2]" in script
+    assert "Y[row] = P[row, 0] + P[row, 1]" in script
 
 
 def test_fake_example_lowers_static_and_dynamic_event_tensor_graph():

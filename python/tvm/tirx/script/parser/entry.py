@@ -139,7 +139,9 @@ class TIRInline(ScriptMacro):
         with parser.with_diag_source(self.source):
             if self.defining_var_table is not None:
                 # Inside-prim_func path: LEGB late binding from the defining scope
-                enclosing_vars = self.defining_var_table.get_at_depth(self.definition_depth)
+                enclosing_vars = self.defining_var_table.get_at_depth(
+                    self.definition_depth
+                )
             else:
                 # Outside-prim_func path: use captured closure vars
                 enclosing_vars = self.closure_vars
@@ -161,7 +163,9 @@ class TIRInline(ScriptMacro):
         return parse_result
 
 
-def inline(*args, definition_depth: int | None = None, defining_var_table=None) -> Callable:
+def inline(
+    *args, definition_depth: int | None = None, defining_var_table=None
+) -> Callable:
     """Decorator for inline function definitions with Python LEGB scoping.
 
     @T.inline follows Python's lexical scoping with late binding:
@@ -197,6 +201,12 @@ def inline(*args, definition_depth: int | None = None, defining_var_table=None) 
         def wrapper(*args, **kwargs):
             return obj(*args, **kwargs)
 
+        wrapper.__name__ = getattr(func, "__name__", "tir_inline")
+        wrapper.__qualname__ = getattr(func, "__qualname__", wrapper.__name__)
+        wrapper.__doc__ = getattr(func, "__doc__", None)
+        wrapper.__wrapped__ = func
+        wrapper.__tvm_tirx_inline__ = True
+        wrapper.__tvm_tirx_inline_obj__ = obj
         return wrapper
 
     if len(args) == 0:

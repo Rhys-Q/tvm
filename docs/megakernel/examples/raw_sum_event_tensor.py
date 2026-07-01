@@ -11,24 +11,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Runnable raw-sum Event Tensor graph example.
+"""Raw-sum Event Tensor megakernel lowering walkthrough.
 
-This file intentionally mirrors ``docs/megakernel/tasks/fake_example.py``:
-the example describes the paper's raw-sum task graph with ``graph_func``,
-``call_device`` and ``ETensor``.  Static/dynamic megakernel details are owned by
-``lower_event_tensor_graph``.
+Run from the TVM repository root:
+
+.. code-block:: bash
+
+   PYTHONPATH=python:.local/python python docs/megakernel/examples/raw_sum_event_tensor.py
+
+The example prints each lowering stage for a static Event Tensor graph:
+
+1. trace ``@graph_func`` into graph calls,
+2. analyze graph metadata,
+3. infer Event Tensor wait_count and runtime resources,
+4. build a static per-CTA task queue,
+5. emit a TIRx PrimFunc,
+6. compile to CUDA source and check synchronization primitives.
 """
 
-import numpy as np
+from __future__ import annotations
+
+import argparse
+import textwrap
+from collections.abc import Iterable
 
 import tvm
+from tvm.script import tirx as T
 from tvm.tirx.lang import (
     ETensor,
     Tensor,
+    analyze_event_tensor_graph,
     call_device,
     device_func,
     graph_func,
     lower_event_tensor_graph,
+    plan_static_event_tensor_graph,
     sym_var,
 )
 
@@ -37,49 +54,64 @@ N_COLS = 128
 K_PARTS = 4
 
 
-class IRModule:
-    @device_func
-    def partial_sum(i: int, j: int, A: Tensor, B: Tensor):
-        B[i * ROW_TILE : i * ROW_TILE + ROW_TILE, j] = sum(
-            A[
-                i * ROW_TILE : i * ROW_TILE + ROW_TILE,
-                j * (N_COLS // K_PARTS) : j * (N_COLS // K_PARTS) + (N_COLS // K_PARTS),
-            ]
-        )
+class RawSumGraph:
+    """Raw row-sum graph with two tile task families."""
 
     @device_func
-    def final_sum(i: int, B: Tensor, C: Tensor):
-        C[i * ROW_TILE : i * ROW_TILE + ROW_TILE] = sum(
-            B[i * ROW_TILE : i * ROW_TILE + ROW_TILE, :]
-        )
+    @T.inline
+    def partial_sum(i, j, A, B, tx):
+        """Compute one row tile and one column partition."""
+
+        if tx < ROW_TILE:
+            row = i * ROW_TILE + tx
+            acc = T.float32(0)
+            for c in T.serial(N_COLS // K_PARTS):
+                acc = acc + A[row, j * (N_COLS // K_PARTS) + c]
+            B[row, j] = acc
+
+    @device_func
+    @T.inline
+    def final_sum(i, B, C, tx):
+        """Wait for all partial sums of a row tile, then reduce them."""
+
+        if tx < ROW_TILE:
+            row = i * ROW_TILE + tx
+            acc = T.float32(0)
+            for j in T.serial(K_PARTS):
+                acc = acc + B[row, j]
+            C[row] = acc
 
     @graph_func
     def main_graph(A: Tensor(("n*32", N_COLS))) -> Tensor(("n*32",)):
         n = sym_var()
-        E = ETensor((n,), wait_count=K_PARTS)
-        B: Tensor((n * ROW_TILE, K_PARTS)) = call_device(
-            IRModule.partial_sum,
+        row_done = ETensor((n,), name="row_done")
+        partial = call_device(
+            RawSumGraph.partial_sum,
             tile_num=(n, K_PARTS),
             args=[A],
-            in_edges={},
-            out_edges={E: "ij->i"},
+            outputs=Tensor((n * ROW_TILE, K_PARTS), name="partial"),
+            out_edges={row_done: "ij->i"},
+            threads=ROW_TILE,
         )
-        C: Tensor((n * ROW_TILE,)) = call_device(
-            IRModule.final_sum,
+        return call_device(
+            RawSumGraph.final_sum,
             tile_num=(n,),
-            args=[B],
-            in_edges={E: "i->i"},
-            out_edges={},
+            args=[partial],
+            outputs=Tensor((n * ROW_TILE,), name="rowsum"),
+            in_edges={row_done: "i->i"},
+            threads=ROW_TILE,
         )
-        return C
 
 
 def trace_graph():
-    return IRModule.main_graph(Tensor(("n*32", N_COLS)))
+    """Trace the graph_func into an EventTensorGraph."""
+
+    return RawSumGraph.main_graph(Tensor(("n*32", N_COLS), name="A"))
 
 
 def build_static(n_tiles: int = 4):
-    breakpoint()
+    """Build the static Event Tensor megakernel PrimFunc."""
+
     return lower_event_tensor_graph(
         trace_graph(),
         n_tiles=n_tiles,
@@ -89,73 +121,119 @@ def build_static(n_tiles: int = 4):
     )
 
 
-def build_dynamic(n_tiles: int = 4, *, early_push: bool = False):
-    return lower_event_tensor_graph(
-        trace_graph(),
-        n_tiles=n_tiles,
-        schedule="dynamic",
-        row_tile=ROW_TILE,
-        n_cols=N_COLS,
-        early_push=early_push,
-    )
-
-
-def _compile(func):
+def _compile_to_cuda_source(func) -> str:
     mod = tvm.IRModule({"main": func})
-    return tvm.compile(mod, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+    rt_mod = tvm.compile(mod, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+    return rt_mod.mod.imports[0].inspect_source()
 
 
-def _make_dynamic_queue(dev, n_tiles: int, *, early_push: bool):
-    partial = 0
-    final = 1
-    capacity = n_tiles * (K_PARTS + 1)
-    queue = np.zeros((capacity, 3), dtype="int32")
-    tail = 0
-    for tile in range(n_tiles):
-        for part in range(K_PARTS):
-            queue[tail] = (partial, tile, part)
-            tail += 1
-        if early_push:
-            queue[tail] = (final, tile, 0)
-            tail += 1
-    return (
-        tvm.runtime.tensor(queue, dev),
-        tvm.runtime.tensor(np.array([0], dtype="int32"), dev),
-        tvm.runtime.tensor(np.array([tail], dtype="int32"), dev),
-        tvm.runtime.tensor(np.array([tail], dtype="int32"), dev),
-        tvm.runtime.tensor(np.array([0], dtype="int32"), dev),
+def _print_header(step: int, title: str) -> None:
+    print(f"\n[{step}] {title}")
+    print("-" * (len(title) + 5))
+
+
+def _format_edges(edges: Iterable[tuple[object, object]]) -> str:
+    items = []
+    for event, edge_map in edges:
+        name = getattr(getattr(event, "base", event), "name", "")
+        src = "".join(edge_map.source_axes)
+        dst = "".join(edge_map.target_axes)
+        items.append(f"{name or '<event>'}: {src}->{dst}")
+    return ", ".join(items) if items else "-"
+
+
+def _print_script_excerpt(script: str, *, lines: int = 80) -> None:
+    excerpt = "\n".join(script.splitlines()[:lines])
+    print(textwrap.indent(excerpt, "  "))
+    if len(script.splitlines()) > lines:
+        print(f"  ... ({len(script.splitlines()) - lines} more lines)")
+
+
+def walkthrough_static_lowering(n_tiles: int = 4, *, show_script: bool = True) -> None:
+    """Print the static Event Tensor lowering process step by step."""
+
+    _print_header(1, "Trace graph_func")
+    graph = trace_graph()
+    for i, call in enumerate(graph.calls):
+        print(
+            f"  call[{i}] name={call.device_func.name} "
+            f"tile_num={call.tile_num} outputs={getattr(call.outputs, 'shape', None)}"
+        )
+        print(f"    in_edges={call.in_edges or '-'}")
+        print(f"    out_edges={call.out_edges or '-'}")
+
+    _print_header(2, "Analyze GraphMetadata")
+    metadata = analyze_event_tensor_graph(graph)
+    print(f"  symbols={metadata.symbols}")
+    print(f"  inputs={[input_spec.shape for input_spec in metadata.inputs]}")
+    print(
+        f"  outputs={[getattr(output, 'shape', None) for output in metadata.outputs]}"
     )
+    for task in metadata.tasks:
+        print(
+            f"  task_type={task.task_type} name={task.name} "
+            f"tile_axes={task.tile_axes} tile_shape={task.tile_shape} "
+            f"inline={task.inline_body is not None}"
+        )
+        print(f"    in_edges={_format_edges(task.in_edges)}")
+        print(f"    out_edges={_format_edges(task.out_edges)}")
+
+    _print_header(3, "Infer EventPlan")
+    event_plan, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
+        metadata, n_tiles=n_tiles
+    )
+    print(f"  event_name={event_plan.event_name}")
+    print(f"  shape={event_plan.shape}")
+    print(f"  wait_count={event_plan.wait_count}")
+    print(f"  backing_buffer={event_plan.backing_buffer}")
+    print(f"  init_policy={event_plan.init_policy}")
+
+    _print_header(4, "Build StaticSchedulePlan")
+    print(f"  num_workers={schedule_plan.num_workers}")
+    print(f"  record_layout={schedule_plan.task_record_layout}")
+    print(f"  queue_offsets={schedule_plan.queue_offsets}")
+    print("  queue_tasks=(task_type, linear_task_id)")
+    for worker in range(schedule_plan.num_workers):
+        begin = schedule_plan.queue_offsets[worker]
+        end = schedule_plan.queue_offsets[worker + 1]
+        print(f"    worker[{worker}] {schedule_plan.queue_tasks[begin:end]}")
+
+    _print_header(5, "Build RuntimeResourcePlan")
+    print(f"  hidden_intermediates={runtime_plan.hidden_intermediates}")
+    print(f"  event_buffers={runtime_plan.event_buffers}")
+    print(f"  init_steps={runtime_plan.init_steps}")
+
+    _print_header(6, "Emit static TIRx PrimFunc")
+    prim_func = build_static(n_tiles)
+    script = prim_func.script()
+    print("  function_name=static_kernel")
+    print("  parameters=A, Y, E_buf, P")
+    if show_script:
+        _print_script_excerpt(script)
+
+    _print_header(7, "Compile and inspect CUDA source")
+    cuda_src = _compile_to_cuda_source(prim_func)
+    checks = {
+        "release_notify": "atom.release.gpu.global.add.s32" in cuda_src,
+        "acquire_wait": "ld.acquire.gpu.global.s32" in cuda_src,
+        "single_kernel": "static_kernel_kernel" in cuda_src,
+    }
+    for name, ok in checks.items():
+        print(f"  {name}={ok}")
+    print("  CUDA source excerpt:")
+    _print_script_excerpt(cuda_src, lines=40)
 
 
-def _run(func, dev, data, ref, *, early_push: bool = False):
-    n_tiles = data.shape[0] // ROW_TILE
-    rt_mod = _compile(func)
-    a_dev = tvm.runtime.tensor(data, dev)
-    y_dev = tvm.runtime.empty((data.shape[0],), dtype="float32", device=dev)
-    e_dev = tvm.runtime.tensor(np.full((n_tiles,), K_PARTS, dtype="int32"), dev)
-    p_dev = tvm.runtime.empty((data.shape[0], K_PARTS), dtype="float32", device=dev)
-    if "dynamic" in func.__name__:
-        queue_args = _make_dynamic_queue(dev, n_tiles, early_push=early_push)
-        rt_mod(a_dev, y_dev, e_dev, p_dev, *queue_args)
-    else:
-        rt_mod(a_dev, y_dev, e_dev, p_dev)
-    got = y_dev.numpy()
-    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
-    print(f"{func.__name__}: max_diff={np.max(np.abs(got - ref)):.6f}")
-
-
-def main():
-    dev = tvm.device("cuda", 0)
-    if not dev.exist:
-        raise RuntimeError("CUDA device is required to run this example")
-
-    n_tiles = 4
-    rows = n_tiles * ROW_TILE
-    data = np.linspace(0, 1, rows * N_COLS, dtype="float32").reshape(rows, N_COLS)
-    ref = np.sum(data, axis=1)
-    _run(build_static(n_tiles), dev, data, ref)
-    _run(build_dynamic(n_tiles), dev, data, ref)
-    _run(build_dynamic(n_tiles, early_push=True), dev, data, ref, early_push=True)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-tiles", type=int, default=4)
+    parser.add_argument(
+        "--no-script",
+        action="store_true",
+        help="Only print summaries, not the emitted TIRx/CUDA excerpts.",
+    )
+    args = parser.parse_args()
+    walkthrough_static_lowering(args.n_tiles, show_script=not args.no_script)
 
 
 if __name__ == "__main__":
