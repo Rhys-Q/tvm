@@ -27,7 +27,7 @@ def main_graph(A: Tensor((M, K)), B: Tensor((K,N))) -> Tensor((LOCAL_M, N)):
     E = ETensor((M // BLK_M, N // BLK_N), wait_count = WORLD_SIZE, shard="S[0]")
     C: Tensor((M, N)) = call_device(matmul, tile_num = (M // BLK_M, N // BLK_N), args = [A,B], in_edges={}, out_edges={E: "ij->ij"})
     
-    E_local = E.local_view()
+    q = E.local_view()
     D: Tensor((LOCAL_M, N)) = call_device(reduce_scatter, tile_num=(LOCAL_M // BLK_M, N // BLK_N), args=[C], in_edges={E_local: "ij->ij"}, out_edges={})
     
     return D
