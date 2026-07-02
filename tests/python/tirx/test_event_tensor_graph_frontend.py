@@ -18,7 +18,6 @@ import importlib.util
 from pathlib import Path
 
 import tvm
-from tvm.script import tirx as T
 from tvm.tirx.lang import (
     ETensor,
     Tensor,
@@ -82,14 +81,12 @@ def test_static_metadata_infers_wait_count_and_schedule():
 
 class InlineRawSum:
     @device_func
-    @T.inline
     def partial_sum(i, j, A, B, tx):
         if tx < 2:
             row = i * 2 + tx
             B[row, j] = A[row, j * 2] + A[row, j * 2 + 1]
 
     @device_func
-    @T.inline
     def final_sum(i, B, C, tx):
         if tx < 2:
             row = i * 2 + tx

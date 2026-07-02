@@ -1,3 +1,4 @@
+from tvm.script import tirx as T
 from tvm.tirx.lang import (
     ETensor,
     Tensor,
@@ -8,26 +9,41 @@ from tvm.tirx.lang import (
     sym_var,
 )
 
+ROW_TILE = 32
+N_COLS = 128
+K_PARTS = 4
+
 
 class IRModule:
     @device_func
-    def partial_sum(i: int, j: int, A: Tensor, B: Tensor):
-        B[i * 32 : i * 32 + 32, j] = sum(A[i * 32 : i * 32 + 32, j * 32 : j * 32 + 32])
+    def partial_sum(i, j, A, B, tx):
+        if tx < ROW_TILE:
+            row = i * ROW_TILE + tx
+            acc = T.float32(0)
+            for c in T.serial(N_COLS // K_PARTS):
+                acc = acc + A[row, j * (N_COLS // K_PARTS) + c]
+            B[row, j] = acc
 
     @device_func
-    def final_sum(i: int, B: Tensor, C: Tensor):
-        C[i * 32 : i * 32 + 32] = sum(B[i * 32 : i * 32 + 32, :])
+    def final_sum(i, B, C, tx):
+        if tx < ROW_TILE:
+            row = i * ROW_TILE + tx
+            acc = T.float32(0)
+            for j in T.serial(K_PARTS):
+                acc = acc + B[row, j]
+            C[row] = acc
 
     @graph_func
-    def main_graph(A: Tensor(("n*32", 128))) -> Tensor(("n*32",)):
+    def main_graph(A: Tensor(("n*32", N_COLS))) -> Tensor(("n*32",)):
         n = sym_var()
-        E = ETensor((n,), wait_count=4)
+        E = ETensor((n,), wait_count=K_PARTS)
         B: Tensor((n * 32, 4)) = call_device(
             IRModule.partial_sum,
-            tile_num=(n, 4),
+            tile_num=(n, K_PARTS),
             args=[A],
             in_edges={},
             out_edges={E: "ij->i"},
+            threads=ROW_TILE,
         )
         C: Tensor((n * 32,)) = call_device(
             IRModule.final_sum,
@@ -35,6 +51,7 @@ class IRModule:
             args=[B],
             in_edges={E: "i->i"},
             out_edges={},
+            threads=ROW_TILE,
         )
         return C
 

@@ -54,13 +54,15 @@ host launch graph，而是一个待 lowering 的设备端 persistent kernel 模�
 ### 2.2 Device Function
 
 `device_func` 表示 tile task body。每个 task 由 task coordinate 标识，例如
-`partial_sum(i, j)` 或 `final_sum(i)`。task body 可以用三种方式在 TIRx 中表达：
+`partial_sum(i, j)` 或 `final_sum(i)`。`@device_func` 会自动把 Python 函数包装成
+TIRx inline body。task body 可以用以下方式在 TIRx 中表达：
 
-- `T.inline` helper：适合第一版 raw sum demo。
+- `@device_func` inline body：适合第一版 raw sum demo。
 - private TIRx PrimFunc：适合较复杂 tile primitive，lowering 前 inline 到 fused kernel。
 - dispatch 分支内直接写 task body：适合生成代码最简单的原型。
 
-第一版推荐使用 `T.inline` 或 dispatch 分支内代码，避免新增独立 device function 调用约定。
+第一版推荐使用 `@device_func` inline body 或 dispatch 分支内代码，避免新增独立 device
+function 调用约定。
 
 ### 2.3 Call Device
 
@@ -393,12 +395,22 @@ trigger policy:
 ```python
 class IRModule:
     @device_func
-    def partial_sum(i: int, j: int, A: Tensor, B: Tensor):
-        B[i*32: i*32 + 32, j] = sum(A[i*32: i*32 + 32, j*32:j*32+32])
+    def partial_sum(i, j, A, B, tx):
+        if tx < 32:
+            row = i * 32 + tx
+            acc = T.float32(0)
+            for c in T.serial(32):
+                acc = acc + A[row, j * 32 + c]
+            B[row, j] = acc
 
     @device_func
-    def final_sum(i: int, B: Tensor, C: Tensor):
-        C[i*32: i*32+32] = sum(B[i*32: i*32+32, :])
+    def final_sum(i, B, C, tx):
+        if tx < 32:
+            row = i * 32 + tx
+            acc = T.float32(0)
+            for j in T.serial(4):
+                acc = acc + B[row, j]
+            C[row] = acc
 
     @graph_func
     def main_graph(A: Tensor(("n*32", 128))) -> Tensor(("n*32",)):
@@ -408,8 +420,9 @@ class IRModule:
             IRModule.partial_sum,
             tile_num=(n, 4),
             args=[A],
-            in_edge={},
+            in_edges={},
             out_edges={E: "ij->i"},
+            threads=32,
         )
         C = call_device(
             IRModule.final_sum,
@@ -417,6 +430,7 @@ class IRModule:
             args=[B],
             in_edges={E: "i->i"},
             out_edges={},
+            threads=32,
         )
         return C
 ```
@@ -469,12 +483,12 @@ def raw_sum_static(A, C, workspace):
         task_type, i, j = static_scheduler_get(sm)
 
         if task_type == PARTIAL:
-            partial_sum(i, j, A, B)
+            partial_sum(i, j, A, B, tx)
             T.event_notify(E, i)
 
         elif task_type == FINAL:
             T.event_wait(E, i)
-            final_sum(i, B, C)
+            final_sum(i, B, C, tx)
 
         static_scheduler_next(sm)
 ```
@@ -513,13 +527,13 @@ def raw_sum_dynamic(A, C, workspace):
         ok, task_type, i, j = T.queue_pop(Q)
         if ok:
             if task_type == PARTIAL:
-                partial_sum(i, j, A, B)
+                partial_sum(i, j, A, B, tx)
                 if T.event_notify(E, i):
                     T.queue_push(Q, FINAL, i, 0)
                 T.queue_finish(Q)
 
             elif task_type == FINAL:
-                final_sum(i, B, C)
+                final_sum(i, B, C, tx)
                 T.queue_finish(Q)
 ```
 

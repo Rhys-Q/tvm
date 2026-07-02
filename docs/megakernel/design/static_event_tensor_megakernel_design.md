@@ -22,7 +22,7 @@ under the License.
 本文只设计 static schedule 下的 Event Tensor megakernel。核心目标是：
 
 - 用户用 `@graph_func` 写 tile-level DAG。
-- 用户用 `@device_func + @T.inline` 写 tile task body。
+- 用户用 `@device_func` 写 tile task body。
 - lowering 后生成一个 host+device mixed PrimFunc。
 - host 部分负责准备 hidden runtime resources。
 - device 部分是一个 fused megakernel，所有 device task body 都 inline 到同一个 task
@@ -118,11 +118,10 @@ def main_graph(A: Tensor((n * ROW_TILE, N_COLS))) -> Tensor((n * ROW_TILE,)):
 
 ### 2.2 device_func
 
-`@device_func` 是 tile task body。第一版只支持 `@T.inline` 实现：
+`@device_func` 是 tile task body。它会自动把 Python 函数包装成 TIRx inline body：
 
 ```python
 @device_func
-@T.inline
 def partial_sum(
     i: T.int32,
     j: T.int32,
@@ -136,7 +135,7 @@ def partial_sum(
 语义：
 
 - `@device_func` 登记 task body 和 graph-level 元信息。
-- `@T.inline` 提供可展开的 TIRx body。
+- `@device_func` 内部应用 TIRx inline 包装，使 body 可在 megakernel dispatch branch 中展开。
 - lowering 不解析 Python Tensor DSL。
 - lowering 不从 `sum(A[...])` 或 Python slice 自动生成 task body。
 - emitter 在 megakernel dispatch branch 中调用 inline body，由 TIRx parser 展开。
@@ -163,7 +162,7 @@ call_device(
 
 含义：
 
-- `fn` 是 `@device_func + @T.inline` task body。
+- `fn` 是 `@device_func` task body。
 - `tile_num` 是 task domain。例如 `(n, 4)` 表示 task coordinate `(i, j)`。
 - `args` 是 graph input 或上游 tensor。
 - `outputs` 是该 task family 产生的 tensor。
@@ -172,7 +171,7 @@ call_device(
 
 ## 3. Lowering Metadata
 
-lowering 需要 Python 侧 metadata，但不需要新建计算 IR。计算 body 已经由 `@T.inline`
+lowering 需要 Python 侧 metadata，但不需要新建计算 IR。计算 body 已经由 `@device_func`
 表达。metadata 只记录 graph、event、schedule 和 hidden resource 信息。
 
 ### 3.1 GraphMetadata
@@ -202,7 +201,7 @@ TaskSpec {
 }
 ```
 
-`inline_body` 是用户写的 `@T.inline` function reference。emitter 用 tile coordinate、
+`inline_body` 是 `@device_func` 自动包装后的 TIRx inline function reference。emitter 用 tile coordinate、
 buffer bindings 和 execution context 调用它。
 
 ### 3.2 EventPlan
@@ -586,7 +585,7 @@ GraphFunction.trace(args)
   -> return GraphMetadata
 ```
 
-`device_func` body 不在 trace 阶段执行。trace 阶段只记录 `@T.inline` body reference。
+`device_func` body 不在 trace 阶段执行。trace 阶段只记录 TIRx inline body reference。
 
 ### 8.2 Analysis
 
@@ -639,7 +638,7 @@ device region:
 
 第一版应拒绝：
 
-- `device_func` 不是 `@T.inline`。
+- `device_func` body 不能被 TIRx inline parser 接受。
 - task family DAG 有环。
 - Event Tensor dtype 不是 `int32`。
 - edge map 输出 rank 和 Event Tensor rank 不一致。
@@ -654,7 +653,7 @@ device region:
 ### 10.1 Unit tests
 
 - graph trace 能生成 GraphMetadata。
-- `@device_func + @T.inline` body 能被 task dispatch branch 调用并展开。
+- `@device_func` body 能被 task dispatch branch 调用并展开。
 - edge map parser 支持 `"ij->i"` 和 `"ij->ij"`。
 - raw sum wait_count 推导为 4。
 - static queue planner 生成 per-CTA queues，并保持 topological order。
@@ -678,7 +677,7 @@ device region:
 1. Frontend metadata。
    - `Tensor` 成为 graph value。
    - `call_device` 记录 TaskSpec。
-   - `@device_func` 只接受 `@T.inline` body。
+   - `@device_func` 自动包装 TIRx inline body。
 
 2. Event analysis。
    - edge map 解析。
@@ -722,7 +721,7 @@ device region:
          prepare hidden resources and static schedule
        device region:
          one fused megakernel
-         all @device_func + @T.inline bodies inline into dispatch loop
+         all @device_func bodies inline into dispatch loop
 ```
 
 用户只写 tile DAG 和 inline task body；framework 负责 hidden resource、event counter、

@@ -359,8 +359,14 @@ class GraphFunction:
 
 
 def device_func(fn: Callable) -> DeviceFunction:
-    """Decorator marking a tile task function."""
+    """Decorator marking a tile task function.
 
+    The task body is automatically wrapped as a TIRx inline function so the
+    megakernel emitter can expand it inside the task dispatch branch.
+    """
+
+    if not getattr(fn, "__tvm_tirx_inline__", False):
+        fn = T.inline(fn)
     return DeviceFunction(fn)
 
 

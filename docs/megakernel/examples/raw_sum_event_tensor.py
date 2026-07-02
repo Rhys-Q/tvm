@@ -58,7 +58,6 @@ class RawSumGraph:
     """Raw row-sum graph with two tile task families."""
 
     @device_func
-    @T.inline
     def partial_sum(i, j, A, B, tx):
         """Compute one row tile and one column partition."""
 
@@ -70,7 +69,6 @@ class RawSumGraph:
             B[row, j] = acc
 
     @device_func
-    @T.inline
     def final_sum(i, B, C, tx):
         """Wait for all partial sums of a row tile, then reduce them."""
 
@@ -135,7 +133,7 @@ def _print_header(step: int, title: str) -> None:
 def _format_edges(edges: Iterable[tuple[object, object]]) -> str:
     items = []
     for event, edge_map in edges:
-        name = getattr(getattr(event, "base", event), "name", "")
+        name = getattr(event, "name", "")
         src = "".join(edge_map.source_axes)
         dst = "".join(edge_map.target_axes)
         items.append(f"{name or '<event>'}: {src}->{dst}")
