@@ -699,7 +699,7 @@ def _make_runtime_plan(
     return RuntimeResourcePlan(
         hidden_intermediates=tuple(hidden_outputs),
         event_buffers=event_plans,
-        static_schedule_buffers=(schedule_plan,),
+        static_schedule_buffers=(),
         init_steps=tuple(
             f"device fill {event_plan.backing_buffer} with {event_plan.wait_count}"
             for event_plan in event_plans
@@ -803,6 +803,7 @@ def lower_event_tensor_graph(
 
 def _build_static_mixed_source(
     metadata: GraphMetadata,
+    dependency_plan: DependencyPlan,
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
     symbols: dict[str, int],
@@ -845,25 +846,25 @@ def _build_static_mixed_source(
         emit,
         metadata,
         schedule_plan,
-        buffer_names,
         event_handles,
         indent=4,
     )
 
-    schedule_offsets = buffer_names["schedule_offsets"]
-    schedule_tasks = buffer_names["schedule_tasks"]
+    task_ranges = _static_task_ranges(metadata, dependency_plan, symbols)
+    total_tasks = task_ranges[-1][2] if task_ranges else 0
     emit(
         4,
-        f"for pos in T.serial({schedule_offsets}[worker], "
-        f"{schedule_offsets}[worker + 1]):",
+        f"for global_task_id in T.serial(worker, {total_tasks}, "
+        f"step={schedule_plan.num_workers}):",
     )
-    emit(8, f"task_type = {schedule_tasks}[pos, 0]")
-    emit(8, f"linear_task_id = {schedule_tasks}[pos, 1]")
 
-    for task in metadata.tasks:
+    task_by_type = {task.task_type: task for task in metadata.tasks}
+    for task_type, start, end in task_ranges:
+        task = task_by_type[task_type]
         body_name = f"task_body_{task.task_type}"
         namespace[body_name] = task.inline_body
-        emit(8, f"if task_type == {task.task_type}:")
+        emit(8, f"if {_format_static_task_range_condition(start, end, total_tasks)}:")
+        emit(12, f"linear_task_id = global_task_id - {start}")
         _emit_task_branch(
             emit,
             task,
@@ -882,7 +883,7 @@ def _build_static_mixed_source(
 def _make_mixed_buffer_bindings(
     metadata: GraphMetadata,
     runtime_plan: RuntimeResourcePlan,
-    schedule_plan: StaticSchedulePlan,
+    _schedule_plan: StaticSchedulePlan,
     symbols: dict[str, int],
 ) -> tuple[dict[Any, str], list[str], list[str]]:
     used_names: set[str] = set()
@@ -927,19 +928,6 @@ def _make_mixed_buffer_bindings(
                 tensor, tensor.name or f"intermediate_{task.task_type}_{index}"
             )
 
-    queue_len = len(schedule_plan.queue_tasks)
-    schedule_offsets_name = _unique_name("schedule_offsets", used_names)
-    schedule_tasks_name = _unique_name("schedule_tasks", used_names)
-    buffer_names["schedule_offsets"] = schedule_offsets_name
-    buffer_names["schedule_tasks"] = schedule_tasks_name
-    allocations.append(
-        f'{schedule_offsets_name} = T.alloc_buffer(({schedule_plan.num_workers + 1},), '
-        '"int32", scope="global")'
-    )
-    allocations.append(
-        f'{schedule_tasks_name} = T.alloc_buffer(({queue_len}, 2), '
-        '"int32", scope="global")'
-    )
     return buffer_names, params, allocations
 
 
@@ -947,7 +935,6 @@ def _emit_static_runtime_init(
     emit: Callable[[int, str], None],
     metadata: GraphMetadata,
     schedule_plan: StaticSchedulePlan,
-    buffer_names: dict[Any, str],
     event_handles: dict[ETensor, str],
     *,
     indent: int,
@@ -958,19 +945,37 @@ def _emit_static_runtime_init(
     for event in metadata.events:
         emit(indent + 8, f"T.event_init({event_handles[event.event]})")
 
-    schedule_offsets = buffer_names["schedule_offsets"]
-    for index, value in enumerate(schedule_plan.queue_offsets):
-        emit(indent + 8, f"{schedule_offsets}[{index}] = {value}")
-
-    schedule_tasks = buffer_names["schedule_tasks"]
-    for index, (task_type, linear_task_id) in enumerate(schedule_plan.queue_tasks):
-        emit(indent + 8, f"{schedule_tasks}[{index}, 0] = {task_type}")
-        emit(indent + 8, f"{schedule_tasks}[{index}, 1] = {linear_task_id}")
-
     emit(
         indent,
         f'T.tvm_storage_sync("global", tx == 0, {schedule_plan.num_workers})',
     )
+
+
+def _static_task_ranges(
+    metadata: GraphMetadata,
+    dependency_plan: DependencyPlan,
+    symbols: dict[str, int],
+) -> tuple[tuple[int, int, int], ...]:
+    task_by_type = {task.task_type: task for task in metadata.tasks}
+    start = 0
+    ranges: list[tuple[int, int, int]] = []
+    for task_type in dependency_plan.topo_order:
+        task = task_by_type[task_type]
+        count = _linear_task_count(_resolve_shape(task.tile_shape, symbols))
+        end = start + count
+        ranges.append((task_type, start, end))
+        start = end
+    return tuple(ranges)
+
+
+def _format_static_task_range_condition(start: int, end: int, total: int) -> str:
+    if start == 0 and end == total:
+        return "True"
+    if start == 0:
+        return f"global_task_id < {end}"
+    if end == total:
+        return f"global_task_id >= {start}"
+    return f"T.And(global_task_id >= {start}, global_task_id < {end})"
 
 
 def _emit_task_branch(
@@ -1111,9 +1116,13 @@ def _lower_static(
     symbols: dict[str, int],
     wait_backoff: int,
 ):
-    del dependency_plan  # The schedule plan has already materialized the topo order.
     source, namespace = _build_static_mixed_source(
-        metadata, runtime_plan, schedule_plan, symbols, wait_backoff
+        metadata,
+        dependency_plan,
+        runtime_plan,
+        schedule_plan,
+        symbols,
+        wait_backoff,
     )
     filename = "<tirx_megakernel_static>"
     linecache.cache[filename] = (

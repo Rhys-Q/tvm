@@ -179,8 +179,9 @@ def test_static_lowering_accepts_inline_task_bodies():
 
     assert "T.ptx.atom_scalar" in script
     assert "T.ptx.ld_acquire" in script
-    assert "if task_type == 0" in script
-    assert "if task_type == 1" in script
+    assert "for global_task_id in range" in script
+    assert "if global_task_id < 4" in script
+    assert "if global_task_id >= 4" in script
     assert "T.tvm_global_barrier_kinit" in script
     assert 'T.tvm_storage_sync("global", tx == 0, 4)' in script
     assert "input_0[row, j * 2]" in script
@@ -193,8 +194,8 @@ def test_static_lowering_accepts_inline_task_bodies():
     assert "schedule_tasks" not in signature
     assert "row_done_buf = T.alloc_buffer((2,), \"int32\")" in script
     assert "intermediate_0_0 = T.alloc_buffer((4, 2))" in script
-    assert "schedule_offsets = T.alloc_buffer((5,), \"int32\")" in script
-    assert "schedule_tasks = T.alloc_buffer((6, 2), \"int32\")" in script
+    assert "schedule_offsets" not in script
+    assert "schedule_tasks" not in script
 
 
 def test_static_lowering_handles_generic_three_stage_graph():
@@ -216,9 +217,9 @@ def test_static_lowering_handles_generic_three_stage_graph():
 
     func = lower_event_tensor_graph(graph, symbol_values={"n": 2}, schedule="static")
     script = func.script()
-    assert "if task_type == 0" in script
-    assert "if task_type == 1" in script
-    assert "if task_type == 2" in script
+    assert "if global_task_id < 2" in script
+    assert "if global_task_id >= 2 and global_task_id < 4" in script
+    assert "if global_task_id >= 4" in script
     assert "e0_buf" in script
     assert "e1_buf" in script
 
