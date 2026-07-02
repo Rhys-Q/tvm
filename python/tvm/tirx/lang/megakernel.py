@@ -242,7 +242,7 @@ class EventPlan:
     shape: tuple[int, ...]
     wait_count: int
     backing_buffer: str
-    init_policy: str = "host"
+    init_policy: str = "device"
 
 
 @dataclass(frozen=True)
@@ -701,7 +701,7 @@ def _make_runtime_plan(
         event_buffers=event_plans,
         static_schedule_buffers=(schedule_plan,),
         init_steps=tuple(
-            f"fill {event_plan.backing_buffer} with {event_plan.wait_count}"
+            f"device fill {event_plan.backing_buffer} with {event_plan.wait_count}"
             for event_plan in event_plans
         ),
     )
@@ -801,14 +801,16 @@ def lower_event_tensor_graph(
     raise ValueError(f"unknown Event Tensor schedule {schedule!r}")
 
 
-def _build_static_kernel_source(
+def _build_static_mixed_source(
     metadata: GraphMetadata,
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
     symbols: dict[str, int],
     wait_backoff: int,
 ) -> tuple[str, dict[str, Any]]:
-    buffer_names, params = _make_buffer_bindings(metadata, runtime_plan, schedule_plan, symbols)
+    buffer_names, params, allocations = _make_mixed_buffer_bindings(
+        metadata, runtime_plan, schedule_plan, symbols
+    )
     used_handle_names = set(buffer_names.values())
     event_handles = {
         event.event: _unique_name(f"E_{event_plan.event_name}", used_handle_names)
@@ -820,6 +822,9 @@ def _build_static_kernel_source(
 
     def emit(indent: int, text: str) -> None:
         lines.append(f"{' ' * indent}{text}")
+
+    for allocation in allocations:
+        emit(4, allocation)
 
     emit(4, "T.device_entry()")
     emit(4, f"worker = T.cta_id([{schedule_plan.num_workers}])")
@@ -835,6 +840,15 @@ def _build_static_kernel_source(
             f"wait_count={event_plan.wait_count}, storage={storage}, "
             f'name="{event_plan.event_name}")',
         )
+
+    _emit_static_runtime_init(
+        emit,
+        metadata,
+        schedule_plan,
+        buffer_names,
+        event_handles,
+        indent=4,
+    )
 
     schedule_offsets = buffer_names["schedule_offsets"]
     schedule_tasks = buffer_names["schedule_tasks"]
@@ -865,17 +879,18 @@ def _build_static_kernel_source(
     return source, namespace
 
 
-def _make_buffer_bindings(
+def _make_mixed_buffer_bindings(
     metadata: GraphMetadata,
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
     symbols: dict[str, int],
-) -> tuple[dict[Any, str], list[str]]:
+) -> tuple[dict[Any, str], list[str], list[str]]:
     used_names: set[str] = set()
     buffer_names: dict[Any, str] = {}
     params: list[str] = []
+    allocations: list[str] = []
 
-    def add_tensor(tensor: Tensor, fallback: str) -> None:
+    def add_param_tensor(tensor: Tensor, fallback: str) -> None:
         if id(tensor) in buffer_names:
             return
         name = _unique_name(tensor.name or fallback, used_names)
@@ -883,32 +898,79 @@ def _make_buffer_bindings(
         buffer_names[id(tensor)] = name
         params.append(f'{name}: T.Buffer({_format_shape(shape)}, "{tensor.dtype}")')
 
+    def add_hidden_tensor(tensor: Tensor, fallback: str) -> None:
+        if id(tensor) in buffer_names:
+            return
+        name = _unique_name(tensor.name or fallback, used_names)
+        shape = _resolve_shape(_as_tuple(tensor.shape), symbols)
+        buffer_names[id(tensor)] = name
+        allocations.append(
+            f'{name} = T.alloc_buffer({_format_shape(shape)}, "{tensor.dtype}", scope="global")'
+        )
+
     for index, tensor in enumerate(metadata.input_values):
-        add_tensor(tensor, f"input_{index}")
+        add_param_tensor(tensor, f"input_{index}")
     for index, tensor in enumerate(_tensor_list(metadata.outputs)):
-        add_tensor(tensor, f"output_{index}")
+        add_param_tensor(tensor, f"output_{index}")
 
     for event_plan in runtime_plan.event_buffers:
         name = _unique_name(event_plan.backing_buffer, used_names)
         buffer_names[f"event:{event_plan.event_name}"] = name
-        params.append(
-            f'{name}: T.Buffer(({_shape_numel(event_plan.shape)},), "int32")'
+        allocations.append(
+            f'{name} = T.alloc_buffer(({_shape_numel(event_plan.shape)},), '
+            '"int32", scope="global")'
         )
 
     for task in metadata.tasks:
         for index, tensor in enumerate(_tensor_list(task.outputs)):
-            add_tensor(tensor, tensor.name or f"intermediate_{task.task_type}_{index}")
+            add_hidden_tensor(
+                tensor, tensor.name or f"intermediate_{task.task_type}_{index}"
+            )
 
     queue_len = len(schedule_plan.queue_tasks)
     schedule_offsets_name = _unique_name("schedule_offsets", used_names)
     schedule_tasks_name = _unique_name("schedule_tasks", used_names)
     buffer_names["schedule_offsets"] = schedule_offsets_name
     buffer_names["schedule_tasks"] = schedule_tasks_name
-    params.append(
-        f'{schedule_offsets_name}: T.Buffer(({schedule_plan.num_workers + 1},), "int32")'
+    allocations.append(
+        f'{schedule_offsets_name} = T.alloc_buffer(({schedule_plan.num_workers + 1},), '
+        '"int32", scope="global")'
     )
-    params.append(f'{schedule_tasks_name}: T.Buffer(({queue_len}, 2), "int32")')
-    return buffer_names, params
+    allocations.append(
+        f'{schedule_tasks_name} = T.alloc_buffer(({queue_len}, 2), '
+        '"int32", scope="global")'
+    )
+    return buffer_names, params, allocations
+
+
+def _emit_static_runtime_init(
+    emit: Callable[[int, str], None],
+    metadata: GraphMetadata,
+    schedule_plan: StaticSchedulePlan,
+    buffer_names: dict[Any, str],
+    event_handles: dict[ETensor, str],
+    *,
+    indent: int,
+) -> None:
+    emit(indent, "T.evaluate(T.tvm_global_barrier_kinit())")
+    emit(indent, "if worker == 0:")
+    emit(indent + 4, "if tx == 0:")
+    for event in metadata.events:
+        emit(indent + 8, f"T.event_init({event_handles[event.event]})")
+
+    schedule_offsets = buffer_names["schedule_offsets"]
+    for index, value in enumerate(schedule_plan.queue_offsets):
+        emit(indent + 8, f"{schedule_offsets}[{index}] = {value}")
+
+    schedule_tasks = buffer_names["schedule_tasks"]
+    for index, (task_type, linear_task_id) in enumerate(schedule_plan.queue_tasks):
+        emit(indent + 8, f"{schedule_tasks}[{index}, 0] = {task_type}")
+        emit(indent + 8, f"{schedule_tasks}[{index}, 1] = {linear_task_id}")
+
+    emit(
+        indent,
+        f'T.tvm_storage_sync("global", tx == 0, {schedule_plan.num_workers})',
+    )
 
 
 def _emit_task_branch(
@@ -1050,7 +1112,7 @@ def _lower_static(
     wait_backoff: int,
 ):
     del dependency_plan  # The schedule plan has already materialized the topo order.
-    source, namespace = _build_static_kernel_source(
+    source, namespace = _build_static_mixed_source(
         metadata, runtime_plan, schedule_plan, symbols, wait_backoff
     )
     filename = "<tirx_megakernel_static>"

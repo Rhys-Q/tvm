@@ -181,8 +181,20 @@ def test_static_lowering_accepts_inline_task_bodies():
     assert "T.ptx.ld_acquire" in script
     assert "if task_type == 0" in script
     assert "if task_type == 1" in script
-    assert "A[row, j * 2]" in script
-    assert "Y[row] = P[row, 0] + P[row, 1]" in script
+    assert "T.tvm_global_barrier_kinit" in script
+    assert 'T.tvm_storage_sync("global", tx == 0, 4)' in script
+    assert "input_0[row, j * 2]" in script
+    assert "output_0[row] = intermediate_0_0[row, 0] + intermediate_0_0[row, 1]" in script
+
+    signature = next(line for line in script.splitlines() if line.startswith("def "))
+    assert "row_done_buf" not in signature
+    assert "intermediate_0_0" not in signature
+    assert "schedule_offsets" not in signature
+    assert "schedule_tasks" not in signature
+    assert "row_done_buf = T.alloc_buffer((2,), \"int32\")" in script
+    assert "intermediate_0_0 = T.alloc_buffer((4, 2))" in script
+    assert "schedule_offsets = T.alloc_buffer((5,), \"int32\")" in script
+    assert "schedule_tasks = T.alloc_buffer((6, 2), \"int32\")" in script
 
 
 def test_static_lowering_handles_generic_three_stage_graph():
@@ -210,6 +222,12 @@ def test_static_lowering_handles_generic_three_stage_graph():
     assert "e0_buf" in script
     assert "e1_buf" in script
 
+    signature = next(line for line in script.splitlines() if line.startswith("def "))
+    assert "e0_buf" not in signature
+    assert "e1_buf" not in signature
+    assert "schedule_offsets" not in signature
+    assert "schedule_tasks" not in signature
+
 
 def test_fake_example_lowers_static_event_tensor_graph():
     fake = _load_fake_example()
@@ -217,6 +235,7 @@ def test_fake_example_lowers_static_event_tensor_graph():
     static_src = _cuda_source(fake.build_static(1))
     assert "atom.release.gpu.global.add.s32" in static_src
     assert "ld.acquire.gpu.global.s32" in static_src
+    assert "tvm_global_barrier_state" in static_src
 
     with pytest.raises(NotImplementedError, match="generic dynamic"):
         fake.build_dynamic(1)

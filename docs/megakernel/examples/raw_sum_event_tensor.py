@@ -25,8 +25,9 @@ The example prints each lowering stage for a static Event Tensor graph:
 2. analyze graph metadata,
 3. infer Event Tensor wait_count and runtime resources,
 4. build a static per-CTA task queue,
-5. emit a TIRx PrimFunc,
-6. compile to CUDA source and check synchronization primitives.
+5. emit a mixed TIRx PrimFunc whose public signature is graph inputs/outputs,
+6. compile to CUDA source and check synchronization primitives,
+7. run the compiled executable and compare against NumPy row sums.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from __future__ import annotations
 import argparse
 import textwrap
 from collections.abc import Iterable
+
+import numpy as np
 
 import tvm
 from tvm.script import tirx as T
@@ -119,9 +122,13 @@ def build_static(n_tiles: int = 4):
     )
 
 
-def _compile_to_cuda_source(func) -> str:
+def _compile(func):
     mod = tvm.IRModule({"main": func})
-    rt_mod = tvm.compile(mod, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+    return tvm.compile(mod, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
+
+
+def _compile_to_cuda_source(func) -> str:
+    rt_mod = _compile(func)
     return rt_mod.mod.imports[0].inspect_source()
 
 
@@ -147,7 +154,33 @@ def _print_script_excerpt(script: str, *, lines: int = 80) -> None:
         print(f"  ... ({len(script.splitlines()) - lines} more lines)")
 
 
-def walkthrough_static_lowering(n_tiles: int = 4, *, show_script: bool = True) -> None:
+def _run_and_check(rt_mod, n_tiles: int) -> None:
+    dev = tvm.cuda(0)
+    if not dev.exist:
+        print("  skipped=True")
+        print("  reason=CUDA device 0 is not available")
+        return
+
+    rng = np.random.default_rng(0)
+    shape = (n_tiles * ROW_TILE, N_COLS)
+    a_np = rng.standard_normal(shape).astype("float32")
+    expected = a_np.sum(axis=1)
+
+    a_tvm = tvm.runtime.tensor(a_np, device=dev)
+    rowsum_tvm = tvm.runtime.tensor(np.zeros((n_tiles * ROW_TILE,), "float32"), device=dev)
+    rt_mod(a_tvm, rowsum_tvm)
+
+    actual = rowsum_tvm.numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    print("  skipped=False")
+    print(f"  input_shape={shape}")
+    print(f"  output_shape={actual.shape}")
+    print("  allclose=True rtol=1e-5 atol=1e-5")
+
+
+def walkthrough_static_lowering(
+    n_tiles: int = 4, *, show_script: bool = True, run: bool = True
+) -> None:
     """Print the static Event Tensor lowering process step by step."""
 
     _print_header(1, "Trace graph_func")
@@ -202,25 +235,35 @@ def walkthrough_static_lowering(n_tiles: int = 4, *, show_script: bool = True) -
     print(f"  event_buffers={runtime_plan.event_buffers}")
     print(f"  init_steps={runtime_plan.init_steps}")
 
-    _print_header(6, "Emit static TIRx PrimFunc")
+    _print_header(6, "Emit mixed static TIRx PrimFunc")
     prim_func = build_static(n_tiles)
     script = prim_func.script()
     print("  function_name=static_kernel")
-    print("  parameters=inputs, outputs, event buffers, hidden buffers, schedule buffers")
+    print("  parameters=graph inputs and outputs only")
+    print("  hidden_resources=allocated in the host section before T.device_entry")
     if show_script:
         _print_script_excerpt(script)
 
     _print_header(7, "Compile and inspect CUDA source")
-    cuda_src = _compile_to_cuda_source(prim_func)
+    rt_mod = _compile(prim_func)
+    cuda_src = rt_mod.mod.imports[0].inspect_source()
     checks = {
         "release_notify": "atom.release.gpu.global.add.s32" in cuda_src,
         "acquire_wait": "ld.acquire.gpu.global.s32" in cuda_src,
+        "runtime_init_barrier": "tvm_global_barrier_state" in cuda_src,
         "single_kernel": "static_kernel_kernel" in cuda_src,
     }
     for name, ok in checks.items():
         print(f"  {name}={ok}")
     print("  CUDA source excerpt:")
     _print_script_excerpt(cuda_src, lines=40)
+
+    _print_header(8, "Run and compare against NumPy")
+    if run:
+        _run_and_check(rt_mod, n_tiles)
+    else:
+        print("  skipped=True")
+        print("  reason=--no-run")
 
 
 def main() -> None:
@@ -231,8 +274,17 @@ def main() -> None:
         action="store_true",
         help="Only print summaries, not the emitted TIRx/CUDA excerpts.",
     )
+    parser.add_argument(
+        "--no-run",
+        action="store_true",
+        help="Skip executable invocation and numerical comparison.",
+    )
     args = parser.parse_args()
-    walkthrough_static_lowering(args.n_tiles, show_script=not args.no_script)
+    walkthrough_static_lowering(
+        args.n_tiles,
+        show_script=not args.no_script,
+        run=not args.no_run,
+    )
 
 
 if __name__ == "__main__":
