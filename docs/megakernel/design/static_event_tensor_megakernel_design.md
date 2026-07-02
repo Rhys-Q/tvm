@@ -214,7 +214,6 @@ EventPlan {
   wait_count
   backing_buffer
   init_policy
-  views
 }
 ```
 
@@ -317,38 +316,7 @@ partial_sum(i, j) 完成后 notify E[i]
 final_sum(i) 执行前 wait E[i] == 0
 ```
 
-### 4.2 local_view and shard mapping
-
-跨设备或分片 graph 需要 local view。例如 matmul + reduce-scatter：
-
-```python
-E = ETensor((M // BLK_M, N // BLK_N), wait_count=WORLD_SIZE, shard="S[0]")
-C = call_device(matmul, tile_num=(M // BLK_M, N // BLK_N), out_edges={E: "ij->ij"})
-
-E_local = E.local_view()
-D = call_device(
-    reduce_scatter,
-    tile_num=(LOCAL_M // BLK_M, N // BLK_N),
-    in_edges={E_local: "ij->ij"},
-)
-```
-
-`E.local_view()` 不创建新 counter，也不复制 storage。它只是 view mapping：
-
-```text
-E_local[i, j] -> E[i + rank * LOCAL_M // BLK_M, j]
-```
-
-因此 consumer wait lowering 为：
-
-```python
-global_i = i + get_rank() * LOCAL_M // BLK_M
-T.event_wait(E, (global_i, j))
-```
-
-第一版只需要支持一维 block shard，例如 `shard="S[0]"`。
-
-### 4.3 Memory ordering
+### 4.2 Memory ordering
 
 producer side：
 
@@ -556,14 +524,14 @@ E_buf[:] = 4
 - schedule policy 可能随 target 改变。
 - 不想为每个 schedule 重新编译 device kernel。
 
-## 7. Matmul + Reduce-Scatter Example
+## 7. Matmul + Epilogue Example
 
 用户 graph：
 
 ```python
 @graph_func
-def main_graph(A: Tensor((M, K)), B: Tensor((K, N))) -> Tensor((LOCAL_M, N)):
-    E = ETensor((M // BLK_M, N // BLK_N), wait_count=WORLD_SIZE, shard="S[0]")
+def main_graph(A: Tensor((M, K)), B: Tensor((K, N))) -> Tensor((M, N)):
+    E = ETensor((M // BLK_M, N // BLK_N), wait_count=1)
     C = call_device(
         matmul,
         tile_num=(M // BLK_M, N // BLK_N),
@@ -571,12 +539,11 @@ def main_graph(A: Tensor((M, K)), B: Tensor((K, N))) -> Tensor((LOCAL_M, N)):
         out_edges={E: "ij->ij"},
     )
 
-    E_local = E.local_view()
     D = call_device(
-        reduce_scatter,
-        tile_num=(LOCAL_M // BLK_M, N // BLK_N),
+        epilogue,
+        tile_num=(M // BLK_M, N // BLK_N),
         args=[C],
-        in_edges={E_local: "ij->ij"},
+        in_edges={E: "ij->ij"},
     )
     return D
 ```
@@ -592,11 +559,10 @@ while tile_scheduler.valid():
         inline matmul(i, j, A, B, C_hidden, tx)
         notify E[i, j]
 
-    elif task_type == TASK_REDUCE_SCATTER:
-        i, j = unflatten(linear, (LOCAL_M // BLK_M, N // BLK_N))
-        global_i = i + get_rank() * LOCAL_M // BLK_M
-        wait E[global_i, j]
-        inline reduce_scatter(i, j, C_hidden, D, tx)
+    elif task_type == TASK_EPILOGUE:
+        i, j = unflatten(linear, (M // BLK_M, N // BLK_N))
+        wait E[i, j]
+        inline epilogue(i, j, C_hidden, D, tx)
 
     tile_scheduler.next_tile()
 ```
@@ -605,8 +571,8 @@ host region 准备：
 
 - hidden global intermediate `C_hidden`。
 - hidden event storage `E_buf`。
-- event init value `WORLD_SIZE`。
-- static queues for `TASK_MATMUL` and `TASK_REDUCE_SCATTER`。
+- event init value `1`。
+- static queues for `TASK_MATMUL` and `TASK_EPILOGUE`。
 
 ## 8. Lowering Pipeline
 
@@ -629,7 +595,6 @@ resolve tensor specs
 parse tile domains
 parse Event Tensor edge maps
 infer wait_count
-resolve local_view/shard maps
 build dependency DAG
 validate acyclic graph
 ```
@@ -680,7 +645,6 @@ device region:
 - edge map 输出 rank 和 Event Tensor rank 不一致。
 - edge map 不是 affine map。
 - wait_count 不能推导为 uniform `PrimExpr`。
-- `local_view()` shard mapping 不能表达为 affine global event index。
 - per-CTA static queue 不满足 DAG topological order。
 - hidden intermediate shape/dtype 无法确定。
 - task body thread extent 和 task family config 冲突。
@@ -693,13 +657,12 @@ device region:
 - `@device_func + @T.inline` body 能被 task dispatch branch 调用并展开。
 - edge map parser 支持 `"ij->i"` 和 `"ij->ij"`。
 - raw sum wait_count 推导为 4。
-- `E.local_view()` lowering 成带 rank offset 的 global event index。
 - static queue planner 生成 per-CTA queues，并保持 topological order。
 
 ### 10.2 Codegen tests
 
 - raw sum static graph 生成 host+device mixed PrimFunc。
-- matmul + reduce-scatter static graph 生成 host+device mixed PrimFunc。
+- matmul + epilogue static graph 生成 host+device mixed PrimFunc。
 - device source 包含 release atomic notify 和 acquire wait。
 - 生成代码不依赖 `_lower_static` 中固定的 raw-sum 模板。
 
@@ -708,7 +671,7 @@ device region:
 - raw sum 单 tile、多 tile correctness。
 - repeated launch correctness：host region 每次正确初始化 Event Tensor。
 - 不同 `num_workers` correctness。
-- matmul + reduce-scatter local shard correctness。
+- matmul + epilogue correctness。
 
 ## 11. Implementation Milestones
 
@@ -720,7 +683,6 @@ device region:
 2. Event analysis。
    - edge map 解析。
    - uniform wait_count inference。
-   - `local_view()` shard lowering。
 
 3. Static scheduler。
    - per-CTA queue construction。

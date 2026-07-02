@@ -78,25 +78,6 @@ class ETensor:
     wait_count: Any = None
     name: str = ""
     dtype: str = "int32"
-    shard: str | None = None
-
-    def local_view(self) -> EventView:
-        """Return a local shard view of this Event Tensor."""
-
-        return EventView(self, shard=self.shard)
-
-
-@dataclass(frozen=True)
-class EventView:
-    """Graph-level Event Tensor view.
-
-    The first implementation only records the view relationship.  Static raw
-    sum lowering uses the base tensor directly; shard-aware lowering can use
-    this metadata to add rank offsets to event indices.
-    """
-
-    base: ETensor
-    shard: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,8 +106,8 @@ class CallDevice:
     tile_num: Any
     args: list[Any]
     outputs: Any = None
-    in_edges: dict[ETensor | EventView, str] = field(default_factory=dict)
-    out_edges: dict[ETensor | EventView, str] = field(default_factory=dict)
+    in_edges: dict[ETensor, str] = field(default_factory=dict)
+    out_edges: dict[ETensor, str] = field(default_factory=dict)
     name: str | None = None
     threads: int | None = None
 
@@ -217,8 +198,8 @@ class TaskSpec:
     tile_shape: tuple[Any, ...]
     inputs: tuple[Any, ...]
     outputs: Any
-    in_edges: tuple[tuple[ETensor | EventView, EdgeMap], ...]
-    out_edges: tuple[tuple[ETensor | EventView, EdgeMap], ...]
+    in_edges: tuple[tuple[ETensor, EdgeMap], ...]
+    out_edges: tuple[tuple[ETensor, EdgeMap], ...]
     threads: int | None
 
 
@@ -242,7 +223,6 @@ class EventPlan:
     wait_count: int
     backing_buffer: str
     init_policy: str = "host"
-    views: tuple[EventView, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -283,10 +263,6 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
     if isinstance(value, list):
         return tuple(value)
     return (value,)
-
-
-def _event_base(event: ETensor | EventView) -> ETensor:
-    return event.base if isinstance(event, EventView) else event
 
 
 def _mul_dim(lhs: Any, rhs: Any) -> Any:
@@ -438,7 +414,6 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
 
     task_specs: list[TaskSpec] = []
     event_wait_counts: dict[ETensor, Any] = {}
-    event_views: dict[ETensor, list[EventView]] = {}
     symbols: set[str] = set()
 
     for task_type, call in enumerate(graph.calls):
@@ -459,10 +434,7 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
             if parsed_in_edges
             else tuple(chr(ord("i") + i) for i in range(len(tile_shape)))
         )
-        for event_or_view, edge_map in parsed_out_edges:
-            event = _event_base(event_or_view)
-            if isinstance(event_or_view, EventView):
-                event_views.setdefault(event, []).append(event_or_view)
+        for event, edge_map in parsed_out_edges:
             inferred = edge_map.uniform_wait_count(tile_shape)
             explicit = event.wait_count
             if explicit is not None and str(explicit) != str(inferred):
@@ -474,10 +446,7 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
                     f"{previous} vs {inferred}"
                 )
             event_wait_counts[event] = inferred
-        for event_or_view, _ in parsed_in_edges:
-            event = _event_base(event_or_view)
-            if isinstance(event_or_view, EventView):
-                event_views.setdefault(event, []).append(event_or_view)
+        for event, _ in parsed_in_edges:
             if event.wait_count is not None:
                 event_wait_counts.setdefault(event, event.wait_count)
 
@@ -499,8 +468,7 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
     events: list[EventSpec] = []
     seen_events: set[ETensor] = set()
     for task in task_specs:
-        for event_or_view, _ in (*task.in_edges, *task.out_edges):
-            event = _event_base(event_or_view)
+        for event, _ in (*task.in_edges, *task.out_edges):
             if event in seen_events:
                 continue
             seen_events.add(event)
@@ -542,10 +510,9 @@ def _validate_static_raw_sum(metadata: GraphMetadata) -> EventSpec:
     producer, consumer = metadata.tasks
     if len(producer.out_edges) != 1 or len(consumer.in_edges) != 1:
         raise ValueError("lowering expects one Event Tensor edge")
-    event_or_view, out_map = producer.out_edges[0]
-    in_event_or_view, in_map = consumer.in_edges[0]
-    event = _event_base(event_or_view)
-    if event != _event_base(in_event_or_view):
+    event, out_map = producer.out_edges[0]
+    in_event, in_map = consumer.in_edges[0]
+    if event != in_event:
         raise ValueError("producer and consumer must use the same Event Tensor")
     if out_map != EdgeMap.parse("ij->i"):
         raise ValueError("producer edge must be 'ij->i'")
@@ -891,7 +858,6 @@ __all__ = [
     "EventPlan",
     "EventSpec",
     "EventTensorGraph",
-    "EventView",
     "GraphFunction",
     "GraphMetadata",
     "RuntimeResourcePlan",
