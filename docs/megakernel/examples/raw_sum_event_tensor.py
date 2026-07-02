@@ -177,14 +177,15 @@ def walkthrough_static_lowering(n_tiles: int = 4, *, show_script: bool = True) -
         print(f"    out_edges={_format_edges(task.out_edges)}")
 
     _print_header(3, "Infer EventPlan")
-    event_plan, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
+    event_plans, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
         metadata, n_tiles=n_tiles
     )
-    print(f"  event_name={event_plan.event_name}")
-    print(f"  shape={event_plan.shape}")
-    print(f"  wait_count={event_plan.wait_count}")
-    print(f"  backing_buffer={event_plan.backing_buffer}")
-    print(f"  init_policy={event_plan.init_policy}")
+    for event_plan in event_plans:
+        print(f"  event_name={event_plan.event_name}")
+        print(f"    shape={event_plan.shape}")
+        print(f"    wait_count={event_plan.wait_count}")
+        print(f"    backing_buffer={event_plan.backing_buffer}")
+        print(f"    init_policy={event_plan.init_policy}")
 
     _print_header(4, "Build StaticSchedulePlan")
     print(f"  num_workers={schedule_plan.num_workers}")
@@ -205,7 +206,7 @@ def walkthrough_static_lowering(n_tiles: int = 4, *, show_script: bool = True) -
     prim_func = build_static(n_tiles)
     script = prim_func.script()
     print("  function_name=static_kernel")
-    print("  parameters=A, Y, E_buf, P")
+    print("  parameters=inputs, outputs, event buffers, hidden buffers, schedule buffers")
     if show_script:
         _print_script_excerpt(script)
 

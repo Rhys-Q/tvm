@@ -16,6 +16,7 @@
 # under the License.
 
 from .megakernel import (
+    DependencyPlan,
     EdgeMap,
     ETensor,
     EventPlan,
@@ -26,6 +27,7 @@ from .megakernel import (
     TaskSpec,
     Tensor,
     TensorSpec,
+    ValidatedGraphMetadata,
     analyze_event_tensor_graph,
     call_device,
     device_func,
@@ -36,6 +38,7 @@ from .megakernel import (
 )
 
 __all__ = [
+    "DependencyPlan",
     "ETensor",
     "EdgeMap",
     "EventPlan",
@@ -46,6 +49,7 @@ __all__ = [
     "TaskSpec",
     "Tensor",
     "TensorSpec",
+    "ValidatedGraphMetadata",
     "analyze_event_tensor_graph",
     "call_device",
     "device_func",
