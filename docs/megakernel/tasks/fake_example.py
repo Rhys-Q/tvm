@@ -6,7 +6,6 @@ from tvm.tirx.lang import (
     device_func,
     graph_func,
     lower_event_tensor_graph,
-    sym_var,
 )
 
 ROW_TILE = 32
@@ -34,23 +33,22 @@ class IRModule:
             C[row] = acc
 
     @graph_func
-    def main_graph(A: Tensor(("n*32", N_COLS))) -> Tensor(("n*32",)):
-        n = sym_var()
-        E = ETensor((n,), wait_count=K_PARTS)
-        B: Tensor((n * 32, 4)) = call_device(
+    def main_graph(A: Tensor, n_tiles: int) -> Tensor:
+        E = ETensor((n_tiles,), wait_count=K_PARTS)
+        B: Tensor = call_device(
             IRModule.partial_sum,
-            tile_num=(n, K_PARTS),
+            tile_num=(n_tiles, K_PARTS),
             args=[A],
-            outputs=Tensor((n * ROW_TILE, K_PARTS)),
+            outputs=Tensor((n_tiles * ROW_TILE, K_PARTS)),
             in_edges={},
             out_edges={E: "ij->i"},
             threads=ROW_TILE,
         )
-        C: Tensor((n * 32,)) = call_device(
+        C: Tensor = call_device(
             IRModule.final_sum,
-            tile_num=(n,),
+            tile_num=(n_tiles,),
             args=[B],
-            outputs=Tensor((n * ROW_TILE,)),
+            outputs=Tensor((n_tiles * ROW_TILE,)),
             in_edges={E: "i->i"},
             out_edges={},
             threads=ROW_TILE,
@@ -58,15 +56,13 @@ class IRModule:
         return C
 
 
-def trace_graph():
-    return IRModule.main_graph(Tensor(("n*32", 128)))
+def trace_graph(n_tiles: int = 1):
+    return IRModule.main_graph(Tensor((n_tiles * ROW_TILE, 128)), n_tiles)
 
 
 def build_static(n_tiles: int = 1):
-    return lower_event_tensor_graph(trace_graph(), n_tiles=n_tiles, schedule="static")
+    return lower_event_tensor_graph(trace_graph(n_tiles), schedule="static")
 
 
-def build_dynamic(n_tiles: int = 1, *, early_push: bool = False):
-    return lower_event_tensor_graph(
-        trace_graph(), n_tiles=n_tiles, schedule="dynamic", early_push=early_push
-    )
+def build_dynamic(n_tiles: int = 1):
+    return lower_event_tensor_graph(trace_graph(n_tiles), schedule="dynamic")

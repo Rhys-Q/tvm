@@ -22,12 +22,14 @@ Run from the TVM repository root:
 The example prints each lowering stage for a static Event Tensor graph:
 
 1. trace ``@graph_func`` into graph calls,
-2. analyze graph metadata,
-3. infer Event Tensor wait_count and runtime resources,
-4. build a static per-CTA task queue,
-5. emit a mixed TIRx PrimFunc whose public signature is graph inputs/outputs,
-6. compile to CUDA source and check synchronization primitives,
-7. run the compiled executable and compare against NumPy row sums.
+2. build graph metadata, the frontend IR used by the lowering path,
+3. derive the task-family dependency plan,
+4. plan concrete event resources for static emission,
+5. build a deterministic static worker/task distribution,
+6. plan hidden runtime resources,
+7. emit a mixed TIRx PrimFunc whose public signature is graph inputs/outputs,
+8. compile to CUDA source and check synchronization primitives,
+9. run the compiled executable and compare against NumPy row sums.
 """
 
 from __future__ import annotations
@@ -48,8 +50,8 @@ from tvm.tirx.lang import (
     device_func,
     graph_func,
     lower_event_tensor_graph,
+    plan_event_tensor_dependencies,
     plan_static_event_tensor_graph,
-    sym_var,
 )
 
 ROW_TILE = 32
@@ -83,53 +85,45 @@ class RawSumGraph:
             C[row] = acc
 
     @graph_func
-    def main_graph(A: Tensor(("n*32", N_COLS))) -> Tensor(("n*32",)):
-        n = sym_var()
-        row_done = ETensor((n,), name="row_done")
+    def main_graph(A: Tensor, n_tiles: int) -> Tensor:
+        row_done = ETensor((n_tiles,), name="row_done")
         partial = call_device(
             RawSumGraph.partial_sum,
-            tile_num=(n, K_PARTS),
+            tile_num=(n_tiles, K_PARTS),
             args=[A],
-            outputs=Tensor((n * ROW_TILE, K_PARTS), name="partial"),
+            outputs=Tensor((n_tiles * ROW_TILE, K_PARTS), name="partial"),
             out_edges={row_done: "ij->i"},
             threads=ROW_TILE,
         )
         return call_device(
             RawSumGraph.final_sum,
-            tile_num=(n,),
+            tile_num=(n_tiles,),
             args=[partial],
-            outputs=Tensor((n * ROW_TILE,), name="rowsum"),
+            outputs=Tensor((n_tiles * ROW_TILE,), name="rowsum"),
             in_edges={row_done: "i->i"},
             threads=ROW_TILE,
         )
 
 
-def trace_graph():
+def trace_graph(n_tiles: int):
     """Trace the graph_func into an EventTensorGraph."""
 
-    return RawSumGraph.main_graph(Tensor(("n*32", N_COLS), name="A"))
+    return RawSumGraph.main_graph(Tensor((n_tiles * ROW_TILE, N_COLS), name="A"), n_tiles)
 
 
-def build_static(n_tiles: int = 4):
+def build_static(n_tiles: int = 4, *, num_workers: int | None = None):
     """Build the static Event Tensor megakernel PrimFunc."""
 
     return lower_event_tensor_graph(
-        trace_graph(),
-        n_tiles=n_tiles,
+        trace_graph(n_tiles),
         schedule="static",
-        row_tile=ROW_TILE,
-        n_cols=N_COLS,
+        num_workers=num_workers,
     )
 
 
 def _compile(func):
     mod = tvm.IRModule({"main": func})
     return tvm.compile(mod, target=tvm.target.Target("cuda"), tir_pipeline="tirx")
-
-
-def _compile_to_cuda_source(func) -> str:
-    rt_mod = _compile(func)
-    return rt_mod.mod.imports[0].inspect_source()
 
 
 def _print_header(step: int, title: str) -> None:
@@ -145,6 +139,16 @@ def _format_edges(edges: Iterable[tuple[object, object]]) -> str:
         dst = "".join(edge_map.target_axes)
         items.append(f"{name or '<event>'}: {src}->{dst}")
     return ", ".join(items) if items else "-"
+
+
+def _format_worker_tasks(schedule_plan) -> list[tuple[tuple[int, int], ...]]:
+    tasks_by_worker = [[] for _ in range(schedule_plan.num_workers)]
+    for task_type, start, end in schedule_plan.task_ranges:
+        for global_task_id in range(start, end):
+            worker = global_task_id % schedule_plan.num_workers
+            linear_task_id = global_task_id - start
+            tasks_by_worker[worker].append((task_type, linear_task_id))
+    return [tuple(tasks) for tasks in tasks_by_worker]
 
 
 def _print_script_excerpt(script: str, *, lines: int = 80) -> None:
@@ -179,12 +183,16 @@ def _run_and_check(rt_mod, n_tiles: int) -> None:
 
 
 def walkthrough_static_lowering(
-    n_tiles: int = 4, *, show_script: bool = True, run: bool = True
+    n_tiles: int = 4,
+    *,
+    num_workers: int | None = None,
+    show_script: bool = True,
+    run: bool = True,
 ) -> None:
     """Print the static Event Tensor lowering process step by step."""
 
     _print_header(1, "Trace graph_func")
-    graph = trace_graph()
+    graph = trace_graph(n_tiles)
     for i, call in enumerate(graph.calls):
         print(
             f"  call[{i}] name={call.device_func.name} "
@@ -193,13 +201,11 @@ def walkthrough_static_lowering(
         print(f"    in_edges={call.in_edges or '-'}")
         print(f"    out_edges={call.out_edges or '-'}")
 
-    _print_header(2, "Analyze GraphMetadata")
+    _print_header(2, "Build GraphMetadata frontend IR")
     metadata = analyze_event_tensor_graph(graph)
     print(f"  symbols={metadata.symbols}")
     print(f"  inputs={[input_spec.shape for input_spec in metadata.inputs]}")
-    print(
-        f"  outputs={[getattr(output, 'shape', None) for output in metadata.outputs]}"
-    )
+    print(f"  outputs={[getattr(output, 'shape', None) for output in metadata.outputs]}")
     for task in metadata.tasks:
         print(
             f"  task_type={task.task_type} name={task.name} "
@@ -209,10 +215,16 @@ def walkthrough_static_lowering(
         print(f"    in_edges={_format_edges(task.in_edges)}")
         print(f"    out_edges={_format_edges(task.out_edges)}")
 
-    _print_header(3, "Infer EventPlan")
+    _print_header(3, "Derive DependencyPlan")
+    dependency_plan = plan_event_tensor_dependencies(metadata)
+    print(f"  topo_order={dependency_plan.topo_order}")
+    print(f"  family_edges={dependency_plan.family_edges}")
+
+    _print_header(4, "Plan concrete static resources")
     event_plans, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
-        metadata, n_tiles=n_tiles
+        metadata, num_workers=num_workers
     )
+    print(f"  concrete_n_tiles={n_tiles}")
     for event_plan in event_plans:
         print(f"  event_name={event_plan.event_name}")
         print(f"    shape={event_plan.shape}")
@@ -220,23 +232,26 @@ def walkthrough_static_lowering(
         print(f"    backing_buffer={event_plan.backing_buffer}")
         print(f"    init_policy={event_plan.init_policy}")
 
-    _print_header(4, "Build StaticSchedulePlan")
+    _print_header(5, "Build StaticSchedulePlan")
     print(f"  num_workers={schedule_plan.num_workers}")
-    print(f"  record_layout={schedule_plan.task_record_layout}")
-    print(f"  queue_offsets={schedule_plan.queue_offsets}")
-    print("  queue_tasks=(task_type, linear_task_id)")
-    for worker in range(schedule_plan.num_workers):
-        begin = schedule_plan.queue_offsets[worker]
-        end = schedule_plan.queue_offsets[worker + 1]
-        print(f"    worker[{worker}] {schedule_plan.queue_tasks[begin:end]}")
+    if num_workers is None:
+        print("  num_workers_source=deterministic example default")
+    else:
+        print("  num_workers_source=explicit --num-workers")
+    print(f"  schedule_policy={schedule_plan.schedule_policy}")
+    print(f"  task_ranges={schedule_plan.task_ranges}")
+    print(f"  total_tasks={schedule_plan.total_tasks}")
+    print("  worker_tasks=(task_type, linear_task_id)")
+    for worker, tasks in enumerate(_format_worker_tasks(schedule_plan)):
+        print(f"    worker[{worker}] {tasks}")
 
-    _print_header(5, "Build RuntimeResourcePlan")
+    _print_header(6, "Build RuntimeResourcePlan")
     print(f"  hidden_intermediates={runtime_plan.hidden_intermediates}")
     print(f"  event_buffers={runtime_plan.event_buffers}")
     print(f"  init_steps={runtime_plan.init_steps}")
 
-    _print_header(6, "Emit mixed static TIRx PrimFunc")
-    prim_func = build_static(n_tiles)
+    _print_header(7, "Emit mixed static TIRx PrimFunc")
+    prim_func = build_static(n_tiles, num_workers=num_workers)
     script = prim_func.script()
     print("  function_name=static_kernel")
     print("  parameters=graph inputs and outputs only")
@@ -244,7 +259,7 @@ def walkthrough_static_lowering(
     if show_script:
         _print_script_excerpt(script)
 
-    _print_header(7, "Compile and inspect CUDA source")
+    _print_header(8, "Compile and inspect CUDA source")
     rt_mod = _compile(prim_func)
     cuda_src = rt_mod.mod.imports[0].inspect_source()
     checks = {
@@ -258,7 +273,7 @@ def walkthrough_static_lowering(
     print("  CUDA source excerpt:")
     _print_script_excerpt(cuda_src, lines=40)
 
-    _print_header(8, "Run and compare against NumPy")
+    _print_header(9, "Run and compare against NumPy")
     if run:
         _run_and_check(rt_mod, n_tiles)
     else:
@@ -269,6 +284,15 @@ def walkthrough_static_lowering(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-tiles", type=int, default=4)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of persistent CTA workers. Defaults to a deterministic "
+            "example value; for real kernels pass a hardware-aware value."
+        ),
+    )
     parser.add_argument(
         "--no-script",
         action="store_true",
@@ -282,6 +306,7 @@ def main() -> None:
     args = parser.parse_args()
     walkthrough_static_lowering(
         args.n_tiles,
+        num_workers=args.num_workers,
         show_script=not args.no_script,
         run=not args.no_run,
     )

@@ -143,9 +143,7 @@ class EdgeMap:
         target = _parse_axis_list(rhs)
         missing = [axis for axis in target if axis not in source]
         if missing:
-            raise ValueError(
-                f"Event edge map target axes {missing} are not in source {source}"
-            )
+            raise ValueError(f"Event edge map target axes {missing} are not in source {source}")
         return EdgeMap(tuple(source), tuple(target))
 
     def projected_extents(self, tile_shape: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -228,10 +226,25 @@ class DependencyPlan:
 
 @dataclass(frozen=True)
 class ValidatedGraphMetadata:
-    """Graph metadata after structural validation."""
+    """Graph metadata paired with its dependency plan.
+
+    Kept as a small compatibility wrapper for callers that still use the
+    historical ``_validate_graph`` helper.  The active lowering path treats the
+    dependency plan as the main product, with validation as a prerequisite.
+    """
 
     metadata: GraphMetadata
     dependency_plan: DependencyPlan
+
+
+@dataclass(frozen=True)
+class StaticLoweringPlan:
+    """All decisions needed before emitting a static megakernel."""
+
+    metadata: GraphMetadata
+    event_plans: tuple[EventPlan, ...]
+    schedule_plan: StaticSchedulePlan
+    runtime_plan: RuntimeResourcePlan
 
 
 @dataclass(frozen=True)
@@ -247,13 +260,12 @@ class EventPlan:
 
 @dataclass(frozen=True)
 class StaticSchedulePlan:
-    """Static per-CTA task queue plan."""
+    """Static global-task-id ranges consumed by the emitted megakernel."""
 
     num_workers: int
-    queue_offsets: tuple[int, ...]
-    queue_tasks: tuple[tuple[int, int], ...]
-    task_record_layout: tuple[str, str] = ("task_type", "linear_task_id")
-    queue_policy: str = "round_robin_topological"
+    task_ranges: tuple[tuple[int, int, int], ...]
+    total_tasks: int
+    schedule_policy: str = "strided_global_task_id"
 
 
 @dataclass(frozen=True)
@@ -262,16 +274,13 @@ class RuntimeResourcePlan:
 
     hidden_intermediates: tuple[TensorSpec, ...]
     event_buffers: tuple[EventPlan, ...]
-    static_schedule_buffers: tuple[StaticSchedulePlan, ...]
     init_steps: tuple[str, ...]
 
 
 def _parse_axis_list(text: str) -> list[str]:
     axes = list(text)
     if not all(axis.isalpha() and axis.islower() for axis in axes):
-        raise ValueError(
-            f"Only one-letter lowercase edge-map axes are supported, got {text!r}"
-        )
+        raise ValueError(f"Only one-letter lowercase edge-map axes are supported, got {text!r}")
     if len(set(axes)) != len(axes):
         raise ValueError(f"Event edge map axes must be unique, got {text!r}")
     return axes
@@ -312,6 +321,24 @@ def _add_dim(lhs: Any, rhs: Any) -> Any:
     return Symbol(f"{lhs}+{rhs}")
 
 
+def _collect_dim_symbols(value: Any) -> set[str]:
+    if isinstance(value, int):
+        return set()
+    if isinstance(value, Symbol):
+        value = value.expr
+    if isinstance(value, str):
+        node = ast.parse(value, mode="eval").body
+        return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+    return set()
+
+
+def _collect_shape_symbols(shape: Any) -> set[str]:
+    symbols: set[str] = set()
+    for dim in _as_tuple(shape):
+        symbols.update(_collect_dim_symbols(dim))
+    return symbols
+
+
 _BINOPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -341,14 +368,16 @@ def _eval_dim_ast(node: ast.AST, symbols: dict[str, int]) -> int:
         op = _BINOPS.get(type(node.op))
         if op is None:
             raise ValueError(f"Unsupported symbolic shape operator {ast.dump(node.op)}")
-        return int(
-            op(_eval_dim_ast(node.left, symbols), _eval_dim_ast(node.right, symbols))
-        )
+        return int(op(_eval_dim_ast(node.left, symbols), _eval_dim_ast(node.right, symbols)))
     raise ValueError(f"Unsupported symbolic shape expression {ast.dump(node)}")
 
 
 def _resolve_shape(shape: Iterable[Any], symbols: dict[str, int]) -> tuple[int, ...]:
     return tuple(_eval_dim(dim, symbols) for dim in shape)
+
+
+def _concrete_shape(shape: Iterable[Any]) -> tuple[int, ...]:
+    return _resolve_shape(shape, {})
 
 
 def _linear_task_count(shape: Iterable[int]) -> int:
@@ -360,14 +389,6 @@ def _linear_task_count(shape: Iterable[int]) -> int:
 
 def _shape_numel(shape: Iterable[int]) -> int:
     return _linear_task_count(shape)
-
-
-def _unflatten_coords(linear: int, shape: tuple[int, ...]) -> tuple[int, ...]:
-    coords: list[int] = []
-    for extent in reversed(shape):
-        coords.append(linear % extent)
-        linear //= extent
-    return tuple(reversed(coords))
 
 
 class _TraceContext:
@@ -389,9 +410,7 @@ class GraphFunction:
         try:
             output = self.fn(*args, **kwargs)
             inputs = list(args) + list(kwargs.values())
-            return EventTensorGraph(
-                calls=_TraceContext.current, output=output, inputs=inputs
-            )
+            return EventTensorGraph(calls=_TraceContext.current, output=output, inputs=inputs)
         finally:
             _TraceContext.current = old
 
@@ -467,8 +486,7 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
     for task_type, call in enumerate(graph.calls):
         tile_shape = _as_tuple(call.tile_num)
         for dim in tile_shape:
-            if isinstance(dim, Symbol):
-                symbols.add(dim.expr)
+            symbols.update(_collect_dim_symbols(dim))
         parsed_in_edges = tuple(
             (event, EdgeMap.parse(spec)) for event, spec in call.in_edges.items()
         )
@@ -484,13 +502,20 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
         )
         for event, edge_map in parsed_out_edges:
             inferred = edge_map.uniform_wait_count(tile_shape)
+            symbols.update(_collect_dim_symbols(inferred))
             previous = inferred_event_wait_counts.get(event, 0)
             inferred_event_wait_counts[event] = _add_dim(previous, inferred)
             if event.wait_count is not None:
                 explicit_event_wait_counts[event] = event.wait_count
+                symbols.update(_collect_dim_symbols(event.wait_count))
         for event, _ in parsed_in_edges:
             if event.wait_count is not None:
                 explicit_event_wait_counts.setdefault(event, event.wait_count)
+                symbols.update(_collect_dim_symbols(event.wait_count))
+
+        for value in (*call.args, *_tensor_list(call.outputs)):
+            if isinstance(value, Tensor):
+                symbols.update(_collect_shape_symbols(value.shape))
 
         task_specs.append(
             TaskSpec(
@@ -523,6 +548,8 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
                 raise ValueError(
                     f"Cannot infer wait_count for Event Tensor {event.name or '<unnamed>'}"
                 )
+            symbols.update(_collect_shape_symbols(event.shape))
+            symbols.update(_collect_dim_symbols(wait_count))
             events.append(
                 EventSpec(
                     event=event,
@@ -538,7 +565,13 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
         for arg in graph.inputs
         if isinstance(arg, Tensor)
     )
+    for arg in graph.inputs:
+        if isinstance(arg, Tensor):
+            symbols.update(_collect_shape_symbols(arg.shape))
     outputs = graph.output if isinstance(graph.output, tuple) else (graph.output,)
+    for output in outputs:
+        if isinstance(output, Tensor):
+            symbols.update(_collect_shape_symbols(output.shape))
     return GraphMetadata(
         symbols=tuple(sorted(symbols)),
         inputs=inputs,
@@ -549,8 +582,13 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
     )
 
 
-def _validate_graph(metadata: GraphMetadata) -> ValidatedGraphMetadata:
-    """Validate a generic Event Tensor graph and build task-family dependencies."""
+def _build_dependency_plan(metadata: GraphMetadata) -> DependencyPlan:
+    """Validate graph structure while deriving task-family dependencies.
+
+    The useful product of this stage is the dependency DAG between task
+    families.  Structural checks live here because the DAG cannot be trusted
+    unless task bodies, edge ranks, and event producers are well formed.
+    """
 
     if not metadata.tasks:
         raise ValueError("Event Tensor graph must contain at least one call_device node")
@@ -595,12 +633,18 @@ def _validate_graph(metadata: GraphMetadata) -> ValidatedGraphMetadata:
                     edges.add((producer, consumer, event_name[event]))
 
     topo_order = _topological_task_order(len(metadata.tasks), tuple(edges))
+    return DependencyPlan(
+        topo_order=topo_order,
+        family_edges=tuple(sorted(edges)),
+    )
+
+
+def _validate_graph(metadata: GraphMetadata) -> ValidatedGraphMetadata:
+    """Compatibility wrapper for dependency planning."""
+
     return ValidatedGraphMetadata(
         metadata=metadata,
-        dependency_plan=DependencyPlan(
-            topo_order=topo_order,
-            family_edges=tuple(sorted(edges)),
-        ),
+        dependency_plan=_build_dependency_plan(metadata),
     )
 
 
@@ -629,64 +673,46 @@ def _topological_task_order(
     return tuple(order)
 
 
-def _make_event_plan(event: EventSpec, symbols: dict[str, int]) -> EventPlan:
+def _make_event_plan(event: EventSpec) -> EventPlan:
     return EventPlan(
         event_name=event.name,
-        shape=_resolve_shape(event.shape, symbols),
-        wait_count=_eval_dim(event.wait_count, symbols),
+        shape=_concrete_shape(event.shape),
+        wait_count=_eval_dim(event.wait_count, {}),
         backing_buffer=f"{event.name}_buf",
     )
 
 
-def _make_event_plans(
-    metadata: GraphMetadata, symbols: dict[str, int]
-) -> tuple[EventPlan, ...]:
-    return tuple(_make_event_plan(event, symbols) for event in metadata.events)
+def _make_event_plans(metadata: GraphMetadata) -> tuple[EventPlan, ...]:
+    return tuple(_make_event_plan(event) for event in metadata.events)
 
 
 def _make_static_schedule_plan(
     metadata: GraphMetadata,
     dependency_plan: DependencyPlan,
-    symbols: dict[str, int],
     num_workers: int,
 ) -> StaticSchedulePlan:
-    queue_tasks_by_worker: list[list[tuple[int, int]]] = [
-        [] for _ in range(num_workers)
-    ]
-    records: list[tuple[int, int]] = []
     task_by_type = {task.task_type: task for task in metadata.tasks}
+    start = 0
+    ranges: list[tuple[int, int, int]] = []
     for task_type in dependency_plan.topo_order:
         task = task_by_type[task_type]
-        shape = _resolve_shape(task.tile_shape, symbols)
-        for linear in range(_linear_task_count(shape)):
-            records.append((task.task_type, linear))
-
-    cursor = 0
-    for record in records:
-        queue_tasks_by_worker[cursor % num_workers].append(record)
-        cursor += 1
-
-    queue_offsets = [0]
-    queue_tasks: list[tuple[int, int]] = []
-    for tasks in queue_tasks_by_worker:
-        queue_tasks.extend(tasks)
-        queue_offsets.append(len(queue_tasks))
+        count = _linear_task_count(_concrete_shape(task.tile_shape))
+        end = start + count
+        ranges.append((task.task_type, start, end))
+        start = end
     return StaticSchedulePlan(
         num_workers=num_workers,
-        queue_offsets=tuple(queue_offsets),
-        queue_tasks=tuple(queue_tasks),
+        task_ranges=tuple(ranges),
+        total_tasks=start,
     )
 
 
 def _make_runtime_plan(
     metadata: GraphMetadata,
     event_plans: tuple[EventPlan, ...],
-    schedule_plan: StaticSchedulePlan,
 ) -> RuntimeResourcePlan:
     hidden_outputs = []
-    public_outputs = {
-        id(output) for output in metadata.outputs if isinstance(output, Tensor)
-    }
+    public_outputs = {id(output) for output in metadata.outputs if isinstance(output, Tensor)}
     seen_hidden: set[int] = set()
     for task in metadata.tasks:
         for output in _tensor_list(task.outputs):
@@ -699,7 +725,6 @@ def _make_runtime_plan(
     return RuntimeResourcePlan(
         hidden_intermediates=tuple(hidden_outputs),
         event_buffers=event_plans,
-        static_schedule_buffers=(),
         init_steps=tuple(
             f"device fill {event_plan.backing_buffer} with {event_plan.wait_count}"
             for event_plan in event_plans
@@ -713,26 +738,70 @@ def analyze_event_tensor_graph(graph: EventTensorGraph) -> GraphMetadata:
     return _analyze_graph(graph)
 
 
-def _resolve_symbol_values(
+def plan_event_tensor_dependencies(metadata: GraphMetadata) -> DependencyPlan:
+    """Derive the task-family dependency DAG for an Event Tensor graph."""
+
+    return _build_dependency_plan(metadata)
+
+
+def _require_static_concrete_shapes(metadata: GraphMetadata) -> None:
+    """Require concrete graph shapes for static megakernel emission.
+
+    TIRx can represent dynamic shapes, but this static megakernel emitter
+    materializes event buffers, hidden intermediates, and a finite task loop in
+    generated source.  Dynamic shape support should be implemented by a dynamic
+    scheduler/lowering path, not by silently specializing this static path.
+    """
+
+    if metadata.symbols:
+        raise ValueError(
+            "static Event Tensor megakernel lowering requires concrete graph shapes, "
+            f"but found symbolic variables {metadata.symbols}. "
+            "Construct the graph with concrete tile extents before calling "
+            "schedule='static', or use a dynamic megakernel lowering path when it is "
+            "implemented."
+        )
+
+
+def _default_static_num_workers(total_tasks: int) -> int:
+    """Choose a deterministic default worker count for static examples/tests.
+
+    Production megakernels usually launch enough persistent CTAs to cover the
+    target SMs.  This frontend currently has no target-aware launcher contract,
+    so callers that know the hardware should pass ``num_workers`` explicitly.
+    """
+
+    return min(4, max(1, total_tasks))
+
+
+def _build_static_lowering_plan(
     metadata: GraphMetadata,
     *,
-    symbol_values: dict[str, int] | None = None,
-    n_tiles: int | None = None,
-) -> dict[str, int]:
-    values = dict(symbol_values or {})
-    if n_tiles is not None:
-        values.setdefault("n", int(n_tiles))
-    missing = [symbol for symbol in metadata.symbols if symbol not in values]
-    if missing:
-        raise ValueError(f"Missing values for symbolic shape variables: {missing}")
-    return values
+    num_workers: int | None = None,
+) -> StaticLoweringPlan:
+    """Plan dependencies, shapes, resources, and static work distribution."""
+
+    dependency_plan = _build_dependency_plan(metadata)
+    _require_static_concrete_shapes(metadata)
+    event_plans = _make_event_plans(metadata)
+    if num_workers is None:
+        total_tasks = sum(
+            _linear_task_count(_concrete_shape(task.tile_shape)) for task in metadata.tasks
+        )
+        num_workers = _default_static_num_workers(total_tasks)
+    schedule_plan = _make_static_schedule_plan(metadata, dependency_plan, num_workers)
+    runtime_plan = _make_runtime_plan(metadata, event_plans)
+    return StaticLoweringPlan(
+        metadata=metadata,
+        event_plans=event_plans,
+        schedule_plan=schedule_plan,
+        runtime_plan=runtime_plan,
+    )
 
 
 def plan_static_event_tensor_graph(
     metadata: GraphMetadata,
     *,
-    n_tiles: int | None = None,
-    symbol_values: dict[str, int] | None = None,
     num_workers: int | None = None,
 ) -> tuple[tuple[EventPlan, ...], StaticSchedulePlan, RuntimeResourcePlan]:
     """Build the static Event Tensor resource and schedule plans.
@@ -742,58 +811,38 @@ def plan_static_event_tensor_graph(
     lowering stage without reimplementing planner details.
     """
 
-    validated = _validate_graph(metadata)
-    symbols = _resolve_symbol_values(
-        metadata, symbol_values=symbol_values, n_tiles=n_tiles
+    plan = _build_static_lowering_plan(
+        metadata,
+        num_workers=num_workers,
     )
-    event_plans = _make_event_plans(metadata, symbols)
-    if num_workers is None:
-        total_tasks = sum(
-            _linear_task_count(_resolve_shape(task.tile_shape, symbols))
-            for task in metadata.tasks
-        )
-        num_workers = min(4, max(1, total_tasks))
-    schedule_plan = _make_static_schedule_plan(
-        metadata, validated.dependency_plan, symbols, num_workers
-    )
-    runtime_plan = _make_runtime_plan(metadata, event_plans, schedule_plan)
-    return event_plans, schedule_plan, runtime_plan
+    return plan.event_plans, plan.schedule_plan, plan.runtime_plan
 
 
 def lower_event_tensor_graph(
     graph: EventTensorGraph,
     *,
-    n_tiles: int | None = None,
-    symbol_values: dict[str, int] | None = None,
     schedule: str = "static",
-    row_tile: int = 32,
-    n_cols: int = 128,
     queue_policy: str = "centralized",
-    early_push: bool = False,
     wait_backoff: int = 0,
     num_workers: int | None = None,
 ):
-    """Lower a supported Event Tensor graph to a TIRx PrimFunc."""
+    """Lower a supported Event Tensor graph to a TIRx PrimFunc.
+
+    The static schedule requires concrete graph shapes.
+    """
 
     metadata = _analyze_graph(graph)
-    validated = _validate_graph(metadata)
-    symbols = _resolve_symbol_values(
-        metadata, symbol_values=symbol_values, n_tiles=n_tiles
-    )
-    _event_plans, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
-        metadata,
-        symbol_values=symbols,
-        num_workers=num_workers,
-    )
     if queue_policy != "centralized":
         raise ValueError("only centralized queue_policy is implemented")
     if schedule == "static":
-        return _lower_static(
+        static_plan = _build_static_lowering_plan(
             metadata,
-            validated.dependency_plan,
-            runtime_plan,
-            schedule_plan,
-            symbols,
+            num_workers=num_workers,
+        )
+        return _lower_static(
+            static_plan.metadata,
+            static_plan.runtime_plan,
+            static_plan.schedule_plan,
             wait_backoff,
         )
     if schedule == "dynamic":
@@ -803,15 +852,11 @@ def lower_event_tensor_graph(
 
 def _build_static_mixed_source(
     metadata: GraphMetadata,
-    dependency_plan: DependencyPlan,
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
-    symbols: dict[str, int],
     wait_backoff: int,
 ) -> tuple[str, dict[str, Any]]:
-    buffer_names, params, allocations = _make_mixed_buffer_bindings(
-        metadata, runtime_plan, schedule_plan, symbols
-    )
+    buffer_names, params, allocations = _make_mixed_buffer_bindings(metadata, runtime_plan)
     used_handle_names = set(buffer_names.values())
     event_handles = {
         event.event: _unique_name(f"E_{event_plan.event_name}", used_handle_names)
@@ -837,7 +882,7 @@ def _build_static_mixed_source(
         storage = buffer_names[f"event:{event.name}"]
         emit(
             4,
-            f'{handle} = T.event_tensor({_format_shape(event_plan.shape)}, '
+            f"{handle} = T.event_tensor({_format_shape(event_plan.shape)}, "
             f"wait_count={event_plan.wait_count}, storage={storage}, "
             f'name="{event_plan.event_name}")',
         )
@@ -850,20 +895,21 @@ def _build_static_mixed_source(
         indent=4,
     )
 
-    task_ranges = _static_task_ranges(metadata, dependency_plan, symbols)
-    total_tasks = task_ranges[-1][2] if task_ranges else 0
     emit(
         4,
-        f"for global_task_id in T.serial(worker, {total_tasks}, "
+        f"for global_task_id in T.serial(worker, {schedule_plan.total_tasks}, "
         f"step={schedule_plan.num_workers}):",
     )
 
     task_by_type = {task.task_type: task for task in metadata.tasks}
-    for task_type, start, end in task_ranges:
+    for task_type, start, end in schedule_plan.task_ranges:
         task = task_by_type[task_type]
         body_name = f"task_body_{task.task_type}"
         namespace[body_name] = task.inline_body
-        emit(8, f"if {_format_static_task_range_condition(start, end, total_tasks)}:")
+        emit(
+            8,
+            f"if {_format_static_task_range_condition(start, end, schedule_plan.total_tasks)}:",
+        )
         emit(12, f"linear_task_id = global_task_id - {start}")
         _emit_task_branch(
             emit,
@@ -871,7 +917,6 @@ def _build_static_mixed_source(
             body_name,
             buffer_names,
             event_handles,
-            symbols,
             wait_backoff,
             indent=12,
         )
@@ -883,8 +928,6 @@ def _build_static_mixed_source(
 def _make_mixed_buffer_bindings(
     metadata: GraphMetadata,
     runtime_plan: RuntimeResourcePlan,
-    _schedule_plan: StaticSchedulePlan,
-    symbols: dict[str, int],
 ) -> tuple[dict[Any, str], list[str], list[str]]:
     used_names: set[str] = set()
     buffer_names: dict[Any, str] = {}
@@ -895,7 +938,7 @@ def _make_mixed_buffer_bindings(
         if id(tensor) in buffer_names:
             return
         name = _unique_name(tensor.name or fallback, used_names)
-        shape = _resolve_shape(_as_tuple(tensor.shape), symbols)
+        shape = _concrete_shape(_as_tuple(tensor.shape))
         buffer_names[id(tensor)] = name
         params.append(f'{name}: T.Buffer({_format_shape(shape)}, "{tensor.dtype}")')
 
@@ -903,7 +946,7 @@ def _make_mixed_buffer_bindings(
         if id(tensor) in buffer_names:
             return
         name = _unique_name(tensor.name or fallback, used_names)
-        shape = _resolve_shape(_as_tuple(tensor.shape), symbols)
+        shape = _concrete_shape(_as_tuple(tensor.shape))
         buffer_names[id(tensor)] = name
         allocations.append(
             f'{name} = T.alloc_buffer({_format_shape(shape)}, "{tensor.dtype}", scope="global")'
@@ -918,15 +961,12 @@ def _make_mixed_buffer_bindings(
         name = _unique_name(event_plan.backing_buffer, used_names)
         buffer_names[f"event:{event_plan.event_name}"] = name
         allocations.append(
-            f'{name} = T.alloc_buffer(({_shape_numel(event_plan.shape)},), '
-            '"int32", scope="global")'
+            f'{name} = T.alloc_buffer(({_shape_numel(event_plan.shape)},), "int32", scope="global")'
         )
 
     for task in metadata.tasks:
         for index, tensor in enumerate(_tensor_list(task.outputs)):
-            add_hidden_tensor(
-                tensor, tensor.name or f"intermediate_{task.task_type}_{index}"
-            )
+            add_hidden_tensor(tensor, tensor.name or f"intermediate_{task.task_type}_{index}")
 
     return buffer_names, params, allocations
 
@@ -951,23 +991,6 @@ def _emit_static_runtime_init(
     )
 
 
-def _static_task_ranges(
-    metadata: GraphMetadata,
-    dependency_plan: DependencyPlan,
-    symbols: dict[str, int],
-) -> tuple[tuple[int, int, int], ...]:
-    task_by_type = {task.task_type: task for task in metadata.tasks}
-    start = 0
-    ranges: list[tuple[int, int, int]] = []
-    for task_type in dependency_plan.topo_order:
-        task = task_by_type[task_type]
-        count = _linear_task_count(_resolve_shape(task.tile_shape, symbols))
-        end = start + count
-        ranges.append((task_type, start, end))
-        start = end
-    return tuple(ranges)
-
-
 def _format_static_task_range_condition(start: int, end: int, total: int) -> str:
     if start == 0 and end == total:
         return "True"
@@ -984,12 +1007,11 @@ def _emit_task_branch(
     body_name: str,
     buffer_names: dict[Any, str],
     event_handles: dict[ETensor, str],
-    symbols: dict[str, int],
     wait_backoff: int,
     *,
     indent: int,
 ) -> None:
-    resolved_shape = _resolve_shape(task.tile_shape, symbols)
+    resolved_shape = _concrete_shape(task.tile_shape)
     axis_vars = _emit_unflatten_coords(emit, task, resolved_shape, indent)
 
     if task.in_edges:
@@ -998,8 +1020,7 @@ def _emit_task_branch(
             event_index = _format_event_index(edge_map, axis_vars)
             emit(
                 indent + 4,
-                f"T.event_wait({event_handles[event]}, {event_index}, "
-                f"backoff={wait_backoff})",
+                f"T.event_wait({event_handles[event]}, {event_index}, backoff={wait_backoff})",
             )
         emit(indent, 'T.tvm_storage_sync("shared")')
 
@@ -1110,18 +1131,14 @@ def _format_shape(shape: tuple[int, ...]) -> str:
 
 def _lower_static(
     metadata: GraphMetadata,
-    dependency_plan: DependencyPlan,
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
-    symbols: dict[str, int],
     wait_backoff: int,
 ):
     source, namespace = _build_static_mixed_source(
         metadata,
-        dependency_plan,
         runtime_plan,
         schedule_plan,
-        symbols,
         wait_backoff,
     )
     filename = "<tirx_megakernel_static>"
@@ -1158,6 +1175,7 @@ __all__ = [
     "device_func",
     "graph_func",
     "lower_event_tensor_graph",
+    "plan_event_tensor_dependencies",
     "plan_static_event_tensor_graph",
     "sym_var",
 ]

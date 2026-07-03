@@ -33,6 +33,7 @@ from .megakernel import (
     device_func,
     graph_func,
     lower_event_tensor_graph,
+    plan_event_tensor_dependencies,
     plan_static_event_tensor_graph,
     sym_var,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "device_func",
     "graph_func",
     "lower_event_tensor_graph",
+    "plan_event_tensor_dependencies",
     "plan_static_event_tensor_graph",
     "sym_var",
 ]

@@ -69,20 +69,16 @@ def test_fake_example_traces_event_tensor_graph():
 
 def test_static_metadata_infers_wait_count_and_schedule():
     fake = _load_fake_example()
-    metadata = _analyze_graph(fake.trace_graph())
+    metadata = _analyze_graph(fake.trace_graph(2))
     validated = _validate_graph(metadata)
-    event_plan = _make_event_plan(metadata.events[0], {"n": 2})
-    schedule_plan = _make_static_schedule_plan(
-        metadata, validated.dependency_plan, {"n": 2}, num_workers=2
-    )
+    event_plan = _make_event_plan(metadata.events[0])
+    schedule_plan = _make_static_schedule_plan(metadata, validated.dependency_plan, num_workers=2)
 
     assert event_plan.shape == (2,)
     assert event_plan.wait_count == 4
-    assert schedule_plan.task_record_layout == ("task_type", "linear_task_id")
-    assert schedule_plan.queue_offsets == (0, 5, 10)
-    assert schedule_plan.queue_tasks[0] == (0, 0)
-    assert schedule_plan.queue_tasks[2] == (0, 4)
-    assert schedule_plan.queue_tasks[-1] == (1, 1)
+    assert schedule_plan.schedule_policy == "strided_global_task_id"
+    assert schedule_plan.task_ranges == ((0, 0, 8), (1, 8, 10))
+    assert schedule_plan.total_tasks == 10
 
 
 class InlineRawSum:
@@ -99,8 +95,8 @@ class InlineRawSum:
             C[row] = B[row, 0] + B[row, 1]
 
     @graph_func
-    def main_graph(A: Tensor(("n*2", 4))) -> Tensor(("n*2",)):
-        n = sym_var()
+    def main_graph(A: Tensor(("n*2", 4)), n_tiles: int | None = None) -> Tensor(("n*2",)):
+        n = n_tiles if n_tiles is not None else sym_var()
         E = ETensor((n,), name="row_done")
         B = call_device(
             InlineRawSum.partial_sum,
@@ -135,8 +131,8 @@ class ThreeStageGraph:
             D[i] = C[i] + T.float32(1)
 
     @graph_func
-    def main_graph(A: Tensor(("n",), name="A")) -> Tensor(("n",)):
-        n = sym_var()
+    def main_graph(A: Tensor(("n",), name="A"), n_tiles: int | None = None) -> Tensor(("n",)):
+        n = n_tiles if n_tiles is not None else sym_var()
         e0 = ETensor((n,), name="e0")
         e1 = ETensor((n,), name="e1")
         B = call_device(
@@ -167,13 +163,10 @@ class ThreeStageGraph:
 
 
 def test_static_lowering_accepts_inline_task_bodies():
-    graph = InlineRawSum.main_graph(Tensor(("n*2", 4)))
+    graph = InlineRawSum.main_graph(Tensor((4, 4)), 2)
     func = lower_event_tensor_graph(
         graph,
-        n_tiles=2,
         schedule="static",
-        row_tile=2,
-        n_cols=4,
     )
     script = func.script()
 
@@ -192,30 +185,28 @@ def test_static_lowering_accepts_inline_task_bodies():
     assert "intermediate_0_0" not in signature
     assert "schedule_offsets" not in signature
     assert "schedule_tasks" not in signature
-    assert "row_done_buf = T.alloc_buffer((2,), \"int32\")" in script
+    assert 'row_done_buf = T.alloc_buffer((2,), "int32")' in script
     assert "intermediate_0_0 = T.alloc_buffer((4, 2))" in script
     assert "schedule_offsets" not in script
     assert "schedule_tasks" not in script
 
 
+def test_static_lowering_rejects_dynamic_shape_graph():
+    graph = InlineRawSum.main_graph(Tensor(("n*2", 4)))
+    with pytest.raises(ValueError, match="requires concrete graph shapes"):
+        lower_event_tensor_graph(graph, schedule="static")
+
+
 def test_static_lowering_handles_generic_three_stage_graph():
-    graph = ThreeStageGraph.main_graph(Tensor(("n",), name="A"))
+    graph = ThreeStageGraph.main_graph(Tensor((2,), name="A"), 2)
     metadata = _analyze_graph(graph)
-    event_plans, schedule_plan, _ = plan_static_event_tensor_graph(
-        metadata, symbol_values={"n": 2}, num_workers=1
-    )
+    event_plans, schedule_plan, _ = plan_static_event_tensor_graph(metadata, num_workers=1)
 
     assert [event.event_name for event in event_plans] == ["e0", "e1"]
-    assert schedule_plan.queue_tasks == (
-        (0, 0),
-        (0, 1),
-        (1, 0),
-        (1, 1),
-        (2, 0),
-        (2, 1),
-    )
+    assert schedule_plan.task_ranges == ((0, 0, 2), (1, 2, 4), (2, 4, 6))
+    assert schedule_plan.total_tasks == 6
 
-    func = lower_event_tensor_graph(graph, symbol_values={"n": 2}, schedule="static")
+    func = lower_event_tensor_graph(graph, schedule="static")
     script = func.script()
     assert "if global_task_id < 2" in script
     assert "if global_task_id >= 2 and global_task_id < 4" in script
