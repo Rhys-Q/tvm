@@ -59,6 +59,7 @@ from tvm.tirx.lang import (
 ROW_TILE = 32
 N_COLS = 128
 K_PARTS = 4
+FINAL_REPEAT = 128
 
 
 class RawSumGraph:
@@ -76,15 +77,16 @@ class RawSumGraph:
             B[row, j] = acc
 
     @device_func
-    def final_sum(i, B, C, tx):
+    def final_sum(i, B, final_repeat, C, tx):
         """Wait for all partial sums of a row tile, then reduce them."""
 
         if tx < ROW_TILE:
             row = i * ROW_TILE + tx
             acc = T.float32(0)
-            for j in T.serial(K_PARTS):
-                acc = acc + B[row, j]
-            C[row] = acc
+            for _ in T.serial(final_repeat):
+                for j in T.serial(K_PARTS):
+                    acc = acc + B[row, j]
+            C[row] = acc / T.cast(final_repeat, "float32")
 
     @graph_func
     def main_graph(A: Tensor, n_tiles: int) -> Tensor:
@@ -100,7 +102,7 @@ class RawSumGraph:
         return call_device(
             RawSumGraph.final_sum,
             tile_num=(n_tiles,),
-            args=[partial],
+            args=[partial, FINAL_REPEAT],
             outputs=Tensor((n_tiles * ROW_TILE,), name="rowsum"),
             in_edges={row_done: "i->i"},
             threads=ROW_TILE,
@@ -208,11 +210,11 @@ def _run_and_check(
         rt_mod(a_tvm, rowsum_tvm)
 
     actual = rowsum_tvm.numpy()
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
     print("  skipped=False")
     print(f"  input_shape={shape}")
     print(f"  output_shape={actual.shape}")
-    print("  allclose=True rtol=1e-5 atol=1e-5")
+    print("  allclose=True rtol=1e-3 atol=1e-3")
 
     if profile_tasks and prof_tvm is not None:
         prof_np = prof_tvm.numpy()
@@ -222,6 +224,7 @@ def _run_and_check(
         if profile_out is not None and event_names is not None:
             try:
                 from tvm.tirx.bench import export_to_perfetto_trace
+
                 export_to_perfetto_trace(prof_np, profile_out, event_names)
                 print(f"  perfetto_trace={Path(profile_out).resolve()}")
             except ImportError as err:
@@ -242,6 +245,8 @@ def walkthrough_static_lowering(
 
     _print_header(1, "Trace graph_func")
     graph = trace_graph(n_tiles)
+    print(f"  constants=ROW_TILE={ROW_TILE} N_COLS={N_COLS} K_PARTS={K_PARTS}")
+    print(f"  final_repeat={FINAL_REPEAT}")
     for i, call in enumerate(graph.calls):
         print(
             f"  call[{i}] name={call.device_func.name} "
@@ -355,8 +360,10 @@ def walkthrough_static_lowering(
 
 
 def main() -> None:
+    global FINAL_REPEAT  # pylint: disable=global-statement
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-tiles", type=int, default=128)
+    parser.add_argument("--n-tiles", type=int, default=192)
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -386,7 +393,16 @@ def main() -> None:
         default="raw_sum_event_tensor.perfetto-trace",
         help="Output path for the Perfetto trace when --profile-tasks is enabled.",
     )
+    parser.add_argument(
+        "--final-repeat",
+        type=int,
+        default=FINAL_REPEAT,
+        help="Repeat the final_sum reduction this many times for profiling visibility.",
+    )
     args = parser.parse_args()
+    if args.final_repeat < 1:
+        raise ValueError("--final-repeat must be at least 1")
+    FINAL_REPEAT = args.final_repeat
     walkthrough_static_lowering(
         args.n_tiles,
         num_workers=args.num_workers,
