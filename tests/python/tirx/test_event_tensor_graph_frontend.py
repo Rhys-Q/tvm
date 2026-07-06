@@ -26,6 +26,7 @@ from tvm.tirx.lang import (
     Tensor,
     call_device,
     device_func,
+    estimate_static_task_profiler_buffer_size,
     graph_func,
     lower_event_tensor_graph,
     plan_static_event_tensor_graph,
@@ -189,6 +190,30 @@ def test_static_lowering_accepts_inline_task_bodies():
     assert "intermediate_0_0 = T.alloc_buffer((4, 2))" in script
     assert "schedule_offsets" not in script
     assert "schedule_tasks" not in script
+
+
+def test_static_lowering_can_profile_task_bodies():
+    graph = InlineRawSum.main_graph(Tensor((4, 4)), 2)
+    metadata = _analyze_graph(graph)
+    _, schedule_plan, _ = plan_static_event_tensor_graph(metadata)
+    profiler_buffer_size = estimate_static_task_profiler_buffer_size(schedule_plan)
+
+    func = lower_event_tensor_graph(
+        graph,
+        schedule="static",
+        profile_tasks=True,
+        profiler_buffer_size=profiler_buffer_size,
+    )
+    script = func.script()
+
+    signature = next(line for line in script.splitlines() if line.startswith("def "))
+    assert "prof: T.Buffer" in signature
+    assert "T.cuda.timer_init" in script
+    assert "T.cuda.timer_start" in script
+    assert "T.cuda.timer_end" in script
+    assert "T.cuda.timer_finalize" in script
+    assert "0, prof.data" in script
+    assert "1, prof.data" in script
 
 
 def test_static_lowering_rejects_dynamic_shape_graph():

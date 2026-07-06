@@ -31,6 +31,7 @@ import operator
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from tvm.script import tirx as T
@@ -275,6 +276,30 @@ class RuntimeResourcePlan:
     hidden_intermediates: tuple[TensorSpec, ...]
     event_buffers: tuple[EventPlan, ...]
     init_steps: tuple[str, ...]
+
+
+def estimate_static_task_profiler_buffer_size(
+    schedule_plan: StaticSchedulePlan,
+    *,
+    records_per_task: int = 2,
+    safety_factor: int = 2,
+) -> int:
+    """Estimate the uint64 buffer size needed by ``CudaProfiler``.
+
+    ``CudaProfiler`` writes one header slot, then each block/group lane writes
+    records with a stride equal to the number of lanes.  Static megakernels use
+    one profiler group per CTA worker.
+    """
+
+    if records_per_task < 0:
+        raise ValueError("records_per_task must be non-negative")
+    if safety_factor < 1:
+        raise ValueError("safety_factor must be at least 1")
+    max_tasks_per_worker = (
+        schedule_plan.total_tasks + schedule_plan.num_workers - 1
+    ) // schedule_plan.num_workers
+    records_per_worker = records_per_task * max_tasks_per_worker + 1
+    return 1 + schedule_plan.num_workers * records_per_worker * safety_factor
 
 
 def _parse_axis_list(text: str) -> list[str]:
@@ -825,6 +850,8 @@ def lower_event_tensor_graph(
     queue_policy: str = "centralized",
     wait_backoff: int = 0,
     num_workers: int | None = None,
+    profile_tasks: bool = False,
+    profiler_buffer_size: int | None = None,
 ):
     """Lower a supported Event Tensor graph to a TIRx PrimFunc.
 
@@ -844,6 +871,8 @@ def lower_event_tensor_graph(
             static_plan.runtime_plan,
             static_plan.schedule_plan,
             wait_backoff,
+            profile_tasks=profile_tasks,
+            profiler_buffer_size=profiler_buffer_size,
         )
     if schedule == "dynamic":
         raise NotImplementedError("generic dynamic megakernel lowering is not implemented")
@@ -855,16 +884,40 @@ def _build_static_mixed_source(
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
     wait_backoff: int,
+    profile_tasks: bool,
+    profiler_buffer_size: int | None,
 ) -> tuple[str, dict[str, Any]]:
     buffer_names, params, allocations = _make_mixed_buffer_bindings(metadata, runtime_plan)
+    if profile_tasks:
+        if profiler_buffer_size is None:
+            profiler_buffer_size = estimate_static_task_profiler_buffer_size(schedule_plan)
+        if profiler_buffer_size <= 0:
+            raise ValueError("profiler_buffer_size must be positive")
+        params.append(f'prof: T.Buffer(({profiler_buffer_size},), "uint64")')
     used_handle_names = set(buffer_names.values())
     event_handles = {
         event.event: _unique_name(f"E_{event_plan.event_name}", used_handle_names)
         for event, event_plan in zip(metadata.events, runtime_plan.event_buffers)
     }
 
+    task_event_names: dict[int, str] = {}
+    used_event_names: set[str] = set()
+    for task in metadata.tasks:
+        task_event_names[task.task_type] = _unique_name(
+            task.name or f"task_{task.task_type}", used_event_names
+        )
     namespace: dict[str, Any] = {"T": T}
-    lines: list[str] = ["@T.prim_func", f"def static_kernel({', '.join(params)}):"]
+    if profile_tasks:
+        from tvm.tirx.bench import CudaProfiler  # pylint: disable=import-outside-toplevel
+
+        namespace["CudaProfiler"] = CudaProfiler
+        namespace["Enum"] = Enum
+        lines: list[str] = ["class TaskEvent(Enum):"]
+        for task in metadata.tasks:
+            lines.append(f"    {task_event_names[task.task_type]} = {task.task_type}")
+        lines.extend(["", "@T.prim_func", f"def static_kernel({', '.join(params)}):"])
+    else:
+        lines = ["@T.prim_func", f"def static_kernel({', '.join(params)}):"]
 
     def emit(indent: int, text: str) -> None:
         lines.append(f"{' ' * indent}{text}")
@@ -876,6 +929,14 @@ def _build_static_mixed_source(
     emit(4, f"worker = T.cta_id([{schedule_plan.num_workers}])")
     threads = max([32, *(task.threads or 0 for task in metadata.tasks)])
     emit(4, f"tx = T.thread_id([{threads}])")
+    if profile_tasks:
+        emit(
+            4,
+            "profiler = CudaProfiler("
+            f"prof, write_stride={schedule_plan.num_workers}, num_groups=1, "
+            "default_leader=(tx == 0))",
+        )
+        emit(4, "profiler.init(0)")
 
     for event, event_plan in zip(metadata.events, runtime_plan.event_buffers):
         handle = event_handles[event.event]
@@ -918,8 +979,13 @@ def _build_static_mixed_source(
             buffer_names,
             event_handles,
             wait_backoff,
+            profiler_name="profiler" if profile_tasks else None,
+            task_event_name=task_event_names[task.task_type],
             indent=12,
         )
+
+    if profile_tasks:
+        emit(4, "profiler.finalize()")
 
     source = "\n".join(lines) + "\n"
     return source, namespace
@@ -1008,6 +1074,8 @@ def _emit_task_branch(
     buffer_names: dict[Any, str],
     event_handles: dict[ETensor, str],
     wait_backoff: int,
+    profiler_name: str | None,
+    task_event_name: str,
     *,
     indent: int,
 ) -> None:
@@ -1026,7 +1094,11 @@ def _emit_task_branch(
 
     call_args = _task_call_args(task, axis_vars, buffer_names)
     _validate_task_signature(task, call_args)
+    if profiler_name is not None:
+        emit(indent, f"{profiler_name}.start(TaskEvent.{task_event_name})")
     emit(indent, f"{body_name}({', '.join(call_args)})")
+    if profiler_name is not None:
+        emit(indent, f"{profiler_name}.end(TaskEvent.{task_event_name})")
 
     if task.out_edges:
         emit(indent, 'T.tvm_storage_sync("shared")')
@@ -1134,12 +1206,17 @@ def _lower_static(
     runtime_plan: RuntimeResourcePlan,
     schedule_plan: StaticSchedulePlan,
     wait_backoff: int,
+    *,
+    profile_tasks: bool = False,
+    profiler_buffer_size: int | None = None,
 ):
     source, namespace = _build_static_mixed_source(
         metadata,
         runtime_plan,
         schedule_plan,
         wait_backoff,
+        profile_tasks,
+        profiler_buffer_size,
     )
     filename = "<tirx_megakernel_static>"
     linecache.cache[filename] = (
@@ -1173,6 +1250,7 @@ __all__ = [
     "analyze_event_tensor_graph",
     "call_device",
     "device_func",
+    "estimate_static_task_profiler_buffer_size",
     "graph_func",
     "lower_event_tensor_graph",
     "plan_event_tensor_dependencies",

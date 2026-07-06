@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import textwrap
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 
@@ -48,6 +49,7 @@ from tvm.tirx.lang import (
     analyze_event_tensor_graph,
     call_device,
     device_func,
+    estimate_static_task_profiler_buffer_size,
     graph_func,
     lower_event_tensor_graph,
     plan_event_tensor_dependencies,
@@ -111,13 +113,21 @@ def trace_graph(n_tiles: int):
     return RawSumGraph.main_graph(Tensor((n_tiles * ROW_TILE, N_COLS), name="A"), n_tiles)
 
 
-def build_static(n_tiles: int = 4, *, num_workers: int | None = None):
+def build_static(
+    n_tiles: int = 4,
+    *,
+    num_workers: int | None = None,
+    profile_tasks: bool = False,
+    profiler_buffer_size: int | None = None,
+):
     """Build the static Event Tensor megakernel PrimFunc."""
 
     return lower_event_tensor_graph(
         trace_graph(n_tiles),
         schedule="static",
         num_workers=num_workers,
+        profile_tasks=profile_tasks,
+        profiler_buffer_size=profiler_buffer_size,
     )
 
 
@@ -151,6 +161,13 @@ def _format_worker_tasks(schedule_plan) -> list[tuple[tuple[int, int], ...]]:
     return [tuple(tasks) for tasks in tasks_by_worker]
 
 
+def _task_event_names(metadata) -> list[str]:
+    return [
+        task.name or f"task_{task.task_type}"
+        for task in sorted(metadata.tasks, key=lambda item: item.task_type)
+    ]
+
+
 def _print_script_excerpt(script: str, *, lines: int = 80) -> None:
     excerpt = "\n".join(script.splitlines()[:lines])
     print(textwrap.indent(excerpt, "  "))
@@ -158,7 +175,15 @@ def _print_script_excerpt(script: str, *, lines: int = 80) -> None:
         print(f"  ... ({len(script.splitlines()) - lines} more lines)")
 
 
-def _run_and_check(rt_mod, n_tiles: int) -> None:
+def _run_and_check(
+    rt_mod,
+    n_tiles: int,
+    *,
+    profile_tasks: bool = False,
+    profiler_buffer_size: int | None = None,
+    profile_out: str | None = None,
+    event_names: list[str] | None = None,
+) -> None:
     dev = tvm.cuda(0)
     if not dev.exist:
         print("  skipped=True")
@@ -172,7 +197,15 @@ def _run_and_check(rt_mod, n_tiles: int) -> None:
 
     a_tvm = tvm.runtime.tensor(a_np, device=dev)
     rowsum_tvm = tvm.runtime.tensor(np.zeros((n_tiles * ROW_TILE,), "float32"), device=dev)
-    rt_mod(a_tvm, rowsum_tvm)
+    prof_tvm = None
+    if profile_tasks:
+        if profiler_buffer_size is None:
+            raise ValueError("profiler_buffer_size is required when profile_tasks=True")
+        prof_tvm = tvm.runtime.tensor(np.zeros((profiler_buffer_size,), "uint64"), device=dev)
+        rt_mod(a_tvm, rowsum_tvm, prof_tvm)
+        dev.sync()
+    else:
+        rt_mod(a_tvm, rowsum_tvm)
 
     actual = rowsum_tvm.numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
@@ -181,6 +214,20 @@ def _run_and_check(rt_mod, n_tiles: int) -> None:
     print(f"  output_shape={actual.shape}")
     print("  allclose=True rtol=1e-5 atol=1e-5")
 
+    if profile_tasks and prof_tvm is not None:
+        prof_np = prof_tvm.numpy()
+        nonzero_records = int(np.count_nonzero(prof_np[1:]))
+        print(f"  profiler_buffer_size={prof_np.shape[0]}")
+        print(f"  profiler_nonzero_records={nonzero_records}")
+        if profile_out is not None and event_names is not None:
+            try:
+                from tvm.tirx.bench import export_to_perfetto_trace
+                export_to_perfetto_trace(prof_np, profile_out, event_names)
+                print(f"  perfetto_trace={Path(profile_out).resolve()}")
+            except ImportError as err:
+                print("  perfetto_trace_skipped=True")
+                print(f"  reason={err}")
+
 
 def walkthrough_static_lowering(
     n_tiles: int = 4,
@@ -188,6 +235,8 @@ def walkthrough_static_lowering(
     num_workers: int | None = None,
     show_script: bool = True,
     run: bool = True,
+    profile_tasks: bool = False,
+    profile_out: str | None = None,
 ) -> None:
     """Print the static Event Tensor lowering process step by step."""
 
@@ -224,6 +273,10 @@ def walkthrough_static_lowering(
     event_plans, schedule_plan, runtime_plan = plan_static_event_tensor_graph(
         metadata, num_workers=num_workers
     )
+    profiler_buffer_size = (
+        estimate_static_task_profiler_buffer_size(schedule_plan) if profile_tasks else None
+    )
+    event_names = _task_event_names(metadata)
     print(f"  concrete_n_tiles={n_tiles}")
     for event_plan in event_plans:
         print(f"  event_name={event_plan.event_name}")
@@ -244,6 +297,10 @@ def walkthrough_static_lowering(
     print("  worker_tasks=(task_type, linear_task_id)")
     for worker, tasks in enumerate(_format_worker_tasks(schedule_plan)):
         print(f"    worker[{worker}] {tasks}")
+    if profile_tasks:
+        print("  profile_tasks=True")
+        print(f"  profiler_buffer_size={profiler_buffer_size}")
+        print(f"  profiler_event_names={event_names}")
 
     _print_header(6, "Build RuntimeResourcePlan")
     print(f"  hidden_intermediates={runtime_plan.hidden_intermediates}")
@@ -251,10 +308,19 @@ def walkthrough_static_lowering(
     print(f"  init_steps={runtime_plan.init_steps}")
 
     _print_header(7, "Emit mixed static TIRx PrimFunc")
-    prim_func = build_static(n_tiles, num_workers=num_workers)
+    prim_func = build_static(
+        n_tiles,
+        num_workers=num_workers,
+        profile_tasks=profile_tasks,
+        profiler_buffer_size=profiler_buffer_size,
+    )
     script = prim_func.script()
     print("  function_name=static_kernel")
-    print("  parameters=graph inputs and outputs only")
+    if profile_tasks:
+        print("  parameters=graph inputs, graph outputs, profiler buffer")
+        print("  profiler_parameter=prof:uint64")
+    else:
+        print("  parameters=graph inputs and outputs only")
     print("  hidden_resources=allocated in the host section before T.device_entry")
     if show_script:
         _print_script_excerpt(script)
@@ -275,7 +341,14 @@ def walkthrough_static_lowering(
 
     _print_header(9, "Run and compare against NumPy")
     if run:
-        _run_and_check(rt_mod, n_tiles)
+        _run_and_check(
+            rt_mod,
+            n_tiles,
+            profile_tasks=profile_tasks,
+            profiler_buffer_size=profiler_buffer_size,
+            profile_out=profile_out,
+            event_names=event_names,
+        )
     else:
         print("  skipped=True")
         print("  reason=--no-run")
@@ -283,11 +356,11 @@ def walkthrough_static_lowering(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-tiles", type=int, default=4)
+    parser.add_argument("--n-tiles", type=int, default=128)
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=None,
+        default=48,
         help=(
             "Number of persistent CTA workers. Defaults to a deterministic "
             "example value; for real kernels pass a hardware-aware value."
@@ -303,12 +376,24 @@ def main() -> None:
         action="store_true",
         help="Skip executable invocation and numerical comparison.",
     )
+    parser.add_argument(
+        "--profile-tasks",
+        action="store_true",
+        help="Record per-CTA task ranges with tvm.tirx.bench.CudaProfiler.",
+    )
+    parser.add_argument(
+        "--profile-out",
+        default="raw_sum_event_tensor.perfetto-trace",
+        help="Output path for the Perfetto trace when --profile-tasks is enabled.",
+    )
     args = parser.parse_args()
     walkthrough_static_lowering(
         args.n_tiles,
         num_workers=args.num_workers,
         show_script=not args.no_script,
         run=not args.no_run,
+        profile_tasks=args.profile_tasks,
+        profile_out=args.profile_out if args.profile_tasks else None,
     )
 
 
