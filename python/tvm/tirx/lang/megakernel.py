@@ -209,7 +209,6 @@ class TaskSpec:
 class GraphMetadata:
     """Lowering metadata for a traced Event Tensor graph."""
 
-    symbols: tuple[str, ...]
     inputs: tuple[TensorSpec, ...]
     input_values: tuple[Tensor, ...]
     outputs: tuple[Any, ...]
@@ -346,24 +345,6 @@ def _add_dim(lhs: Any, rhs: Any) -> Any:
     return Symbol(f"{lhs}+{rhs}")
 
 
-def _collect_dim_symbols(value: Any) -> set[str]:
-    if isinstance(value, int):
-        return set()
-    if isinstance(value, Symbol):
-        value = value.expr
-    if isinstance(value, str):
-        node = ast.parse(value, mode="eval").body
-        return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
-    return set()
-
-
-def _collect_shape_symbols(shape: Any) -> set[str]:
-    symbols: set[str] = set()
-    for dim in _as_tuple(shape):
-        symbols.update(_collect_dim_symbols(dim))
-    return symbols
-
-
 _BINOPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -389,6 +370,11 @@ def _eval_dim_ast(node: ast.AST, symbols: dict[str, int]) -> int:
         return int(node.value)
     if isinstance(node, ast.Name) and node.id in symbols:
         return int(symbols[node.id])
+    if isinstance(node, ast.Name):
+        raise ValueError(
+            "static Event Tensor megakernel lowering requires concrete graph shapes, "
+            f"but found symbolic dimension {node.id!r}"
+        )
     if isinstance(node, ast.BinOp):
         op = _BINOPS.get(type(node.op))
         if op is None:
@@ -506,12 +492,9 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
     task_specs: list[TaskSpec] = []
     inferred_event_wait_counts: dict[ETensor, Any] = {}
     explicit_event_wait_counts: dict[ETensor, Any] = {}
-    symbols: set[str] = set()
 
     for task_type, call in enumerate(graph.calls):
         tile_shape = _as_tuple(call.tile_num)
-        for dim in tile_shape:
-            symbols.update(_collect_dim_symbols(dim))
         parsed_in_edges = tuple(
             (event, EdgeMap.parse(spec)) for event, spec in call.in_edges.items()
         )
@@ -527,20 +510,13 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
         )
         for event, edge_map in parsed_out_edges:
             inferred = edge_map.uniform_wait_count(tile_shape)
-            symbols.update(_collect_dim_symbols(inferred))
             previous = inferred_event_wait_counts.get(event, 0)
             inferred_event_wait_counts[event] = _add_dim(previous, inferred)
             if event.wait_count is not None:
                 explicit_event_wait_counts[event] = event.wait_count
-                symbols.update(_collect_dim_symbols(event.wait_count))
         for event, _ in parsed_in_edges:
             if event.wait_count is not None:
                 explicit_event_wait_counts.setdefault(event, event.wait_count)
-                symbols.update(_collect_dim_symbols(event.wait_count))
-
-        for value in (*call.args, *_tensor_list(call.outputs)):
-            if isinstance(value, Tensor):
-                symbols.update(_collect_shape_symbols(value.shape))
 
         task_specs.append(
             TaskSpec(
@@ -573,8 +549,6 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
                 raise ValueError(
                     f"Cannot infer wait_count for Event Tensor {event.name or '<unnamed>'}"
                 )
-            symbols.update(_collect_shape_symbols(event.shape))
-            symbols.update(_collect_dim_symbols(wait_count))
             events.append(
                 EventSpec(
                     event=event,
@@ -590,15 +564,8 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
         for arg in graph.inputs
         if isinstance(arg, Tensor)
     )
-    for arg in graph.inputs:
-        if isinstance(arg, Tensor):
-            symbols.update(_collect_shape_symbols(arg.shape))
     outputs = graph.output if isinstance(graph.output, tuple) else (graph.output,)
-    for output in outputs:
-        if isinstance(output, Tensor):
-            symbols.update(_collect_shape_symbols(output.shape))
     return GraphMetadata(
-        symbols=tuple(sorted(symbols)),
         inputs=inputs,
         input_values=tuple(arg for arg in graph.inputs if isinstance(arg, Tensor)),
         outputs=tuple(outputs),
@@ -769,25 +736,6 @@ def plan_event_tensor_dependencies(metadata: GraphMetadata) -> DependencyPlan:
     return _build_dependency_plan(metadata)
 
 
-def _require_static_concrete_shapes(metadata: GraphMetadata) -> None:
-    """Require concrete graph shapes for static megakernel emission.
-
-    TIRx can represent dynamic shapes, but this static megakernel emitter
-    materializes event buffers, hidden intermediates, and a finite task loop in
-    generated source.  Dynamic shape support should be implemented by a dynamic
-    scheduler/lowering path, not by silently specializing this static path.
-    """
-
-    if metadata.symbols:
-        raise ValueError(
-            "static Event Tensor megakernel lowering requires concrete graph shapes, "
-            f"but found symbolic variables {metadata.symbols}. "
-            "Construct the graph with concrete tile extents before calling "
-            "schedule='static', or use a dynamic megakernel lowering path when it is "
-            "implemented."
-        )
-
-
 def _default_static_num_workers(total_tasks: int) -> int:
     """Choose a deterministic default worker count for static examples/tests.
 
@@ -807,7 +755,6 @@ def _build_static_lowering_plan(
     """Plan dependencies, shapes, resources, and static work distribution."""
 
     dependency_plan = _build_dependency_plan(metadata)
-    _require_static_concrete_shapes(metadata)
     event_plans = _make_event_plans(metadata)
     if num_workers is None:
         total_tasks = sum(
