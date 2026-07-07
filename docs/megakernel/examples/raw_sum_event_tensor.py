@@ -257,7 +257,7 @@ def walkthrough_static_lowering(
 
     _print_header(2, "Build GraphMetadata frontend IR")
     metadata = analyze_event_tensor_graph(graph)
-    print(f"  inputs={[input_spec.shape for input_spec in metadata.inputs]}")
+    print(f"  inputs={[input_tensor.shape for input_tensor in metadata.inputs]}")
     print(f"  outputs={[getattr(output, 'shape', None) for output in metadata.outputs]}")
     for task in metadata.tasks:
         print(

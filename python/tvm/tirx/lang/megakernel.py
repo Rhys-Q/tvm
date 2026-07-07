@@ -209,8 +209,7 @@ class TaskSpec:
 class GraphMetadata:
     """Lowering metadata for a traced Event Tensor graph."""
 
-    inputs: tuple[TensorSpec, ...]
-    input_values: tuple[Tensor, ...]
+    inputs: tuple[Tensor, ...]
     outputs: tuple[Any, ...]
     tasks: tuple[TaskSpec, ...]
     events: tuple[EventSpec, ...]
@@ -559,15 +558,10 @@ def _analyze_graph(graph: EventTensorGraph) -> GraphMetadata:
                 )
             )
 
-    inputs = tuple(
-        TensorSpec(arg.shape, arg.dtype, arg.name)
-        for arg in graph.inputs
-        if isinstance(arg, Tensor)
-    )
+    inputs = tuple(arg for arg in graph.inputs if isinstance(arg, Tensor))
     outputs = graph.output if isinstance(graph.output, tuple) else (graph.output,)
     return GraphMetadata(
         inputs=inputs,
-        input_values=tuple(arg for arg in graph.inputs if isinstance(arg, Tensor)),
         outputs=tuple(outputs),
         tasks=tuple(task_specs),
         events=tuple(events),
@@ -965,7 +959,7 @@ def _make_mixed_buffer_bindings(
             f'{name} = T.alloc_buffer({_format_shape(shape)}, "{tensor.dtype}", scope="global")'
         )
 
-    for index, tensor in enumerate(metadata.input_values):
+    for index, tensor in enumerate(metadata.inputs):
         add_param_tensor(tensor, f"input_{index}")
     for index, tensor in enumerate(_tensor_list(metadata.outputs)):
         add_param_tensor(tensor, f"output_{index}")
